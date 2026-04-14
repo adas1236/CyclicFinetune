@@ -1,0 +1,7 @@
+checkpoints
+logs
+data
+wandb
+.venv
+__pycache__
+*.sh
