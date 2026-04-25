@@ -5,3 +5,8 @@ wandb
 .venv
 __pycache__
 *.sh
+scripts
+geometries.json
+.gradio/
+*.md
+gradio_tmp
