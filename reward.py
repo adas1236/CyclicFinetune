@@ -1,9 +1,12 @@
 """
 Reward functions for GRPO training.
 
-The cyclic ordering problem has a perfectly verifiable reward:
-given three points, sgn(det(B-A, C-A)) determines the answer
-deterministically. This makes it ideal for outcome-based RL.
+The cyclic-ordering problem with `n >= 3` points is fully determined by the
+n-2 pairwise cross products around the center. The model's answer is one of
+'clockwise', 'counterclockwise', or 'neither' (mixed). Ground truth is the
+`answer` field stored in the meta dict (already computed during dataset
+generation); a fallback recomputation from `meta["geometries"]` is provided
+for backwards compatibility.
 """
 
 from __future__ import annotations
@@ -13,48 +16,80 @@ import re
 from tools import compute_cyclic_order, representative_point
 
 
+_VALID_ANSWERS = ("clockwise", "counterclockwise", "neither")
+
+
 def extract_answer(text: str) -> str | None:
     """
-    Extract 'clockwise' or 'counterclockwise' from model output.
-    Returns None if neither is found.
+    Extract 'clockwise', 'counterclockwise', or 'neither' from model output.
+    The last keyword to appear in the text wins (so a final answer overrides
+    intermediate reasoning). Returns None if none are found.
     """
     text_lower = text.lower()
 
-    # Look for the last occurrence (the final answer, not intermediate reasoning)
-    # Find all matches
-    cw_positions = [m.start() for m in re.finditer(r"\bcounterclockwise\b", text_lower)]
-    ccw_last = cw_positions[-1] if cw_positions else -1
+    ccw_positions = [m.start() for m in re.finditer(r"\bcounterclockwise\b", text_lower)]
+    ccw_last = ccw_positions[-1] if ccw_positions else -1
 
-    # "clockwise" that is NOT part of "counterclockwise"
     cw_only_positions = []
     for m in re.finditer(r"\bclockwise\b", text_lower):
-        # Check it's not preceded by "counter"
         start = m.start()
         prefix = text_lower[max(0, start - 7) : start]
         if "counter" not in prefix:
             cw_only_positions.append(start)
     cw_last = cw_only_positions[-1] if cw_only_positions else -1
 
-    if ccw_last > cw_last:
-        return "counterclockwise"
-    elif cw_last > ccw_last:
+    neither_positions = [m.start() for m in re.finditer(r"\bneither\b", text_lower)]
+    neither_last = neither_positions[-1] if neither_positions else -1
+
+    candidates = [
+        ("counterclockwise", ccw_last),
+        ("clockwise", cw_last),
+        ("neither", neither_last),
+    ]
+    candidates = [c for c in candidates if c[1] >= 0]
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda c: c[1])[0]
+
+
+def _combine_arcs(arc_labels: list[str]) -> str:
+    if not arc_labels:
+        raise ValueError("Need at least one pairwise arc to combine.")
+    if all(a == "clockwise" for a in arc_labels):
         return "clockwise"
-    return None
+    if all(a == "counterclockwise" for a in arc_labels):
+        return "counterclockwise"
+    return "neither"
 
 
 def compute_ground_truth(meta: dict) -> str:
     """
-    Compute the ground-truth answer from the metadata stored in the JSONL.
+    Return the ground-truth answer for a record's metadata.
+
+    Prefers `meta["answer"]` (written by `prepare_data.py`). Falls back to
+    recomputing from `meta["geometries"]` (index 0 = center, rest in order)
+    if `answer` is missing.
     """
-    location_names = meta["location_names"]
+    stored = meta.get("answer")
+    if stored is not None:
+        stored = str(stored).strip().lower()
+        if stored in _VALID_ANSWERS:
+            return stored
+
     geometries = meta["geometries"]
-    idx_a, idx_b, idx_c = meta["center_idx"], meta["b_idx"], meta["c_idx"]
+    if len(geometries) < 3:
+        raise ValueError(
+            f"meta['geometries'] must have length >= 3, got {len(geometries)}"
+        )
 
-    a_pt = representative_point(geometries[idx_a])
-    b_pt = representative_point(geometries[idx_b])
-    c_pt = representative_point(geometries[idx_c])
-
-    return compute_cyclic_order(a_pt, b_pt, c_pt)
+    pts = [representative_point(g) for g in geometries]
+    center = pts[0]
+    arcs = [
+        compute_cyclic_order(center, pts[i], pts[i + 1])
+        for i in range(1, len(pts) - 1)
+    ]
+    return _combine_arcs(arcs)
 
 
 def correctness_reward(completion: str, meta: dict) -> float:

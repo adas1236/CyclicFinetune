@@ -52,8 +52,11 @@ def main():
                         help="Sequence length for SFT forward/backward")
     parser.add_argument("--num_generations", type=int, default=4,
                         help="GRPO completions per prompt (G parameter)")
-    parser.add_argument("--gen_length", type=int, default=512,
-                        help="Max tokens per generation (max_completion_length)")
+    parser.add_argument("--gen_length", type=int, default=1024,
+                        help="Max tokens per generation (max_completion_length). "
+                             "Default 1024 matches train_rl.py / evaluate.py "
+                             "to cover up to n-2=8 cyclic_order tool calls "
+                             "in pipeline 2 (n=10 worst case).")
     parser.add_argument("--lora_r", type=int, default=64)
     parser.add_argument("--lora_alpha", type=int, default=128)
     parser.add_argument("--no_4bit", action="store_true", default=False)

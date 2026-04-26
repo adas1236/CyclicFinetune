@@ -75,7 +75,7 @@ class ValAccuracyCallback(TrainerCallback):
 
             with torch.no_grad():
                 output = model.generate(
-                    **inputs, max_new_tokens=256,
+                    **inputs, max_new_tokens=512,
                     do_sample=False, pad_token_id=self.tokenizer.pad_token_id,
                 )
             completion = self.tokenizer.decode(

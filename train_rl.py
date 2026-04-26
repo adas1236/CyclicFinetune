@@ -131,7 +131,12 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./checkpoints/rl")
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--max_seq_length", type=int, default=2048)
-    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument(
+        "--max_new_tokens", type=int, default=1024,
+        help="Generation budget per completion. Bumped from 512 to 1024 to "
+             "accommodate up to n-2=8 cyclic_order tool calls in pipeline 2 "
+             "(n=10 worst case).",
+    )
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=-1,
                         help="Max training steps (-1 = use num_epochs instead). Useful for quick tests.")

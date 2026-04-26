@@ -5,34 +5,40 @@ formatted as multi-turn conversations with tool calls.
 Expected parquet columns:
   - question_id (int)
   - question (str)
-  - location_names (sequence of str)
-  - geometries (sequence of dicts with "type" and "coordinates" keys)
-  - answer (str)
-  - roles (dict with keys "center", "b", "c" — each value is an int index
-           into the location_names / geometries arrays)
+  - location_names (sequence of str, length n)
+  - geometries (sequence of dicts with "type" and "coordinates" keys, length n)
+      • index 0 is the CENTER
+      • indices 1..n-1 are the path waypoints in order
+  - answer (str): one of "clockwise", "counterclockwise", "neither"
 
-Each row becomes a conversation:
+Each row becomes a conversation. Let n = len(geometries). The path has
+n-1 waypoints and n-2 pairwise arcs.
 
-Pipeline 1 (internal computation):
+Pipeline 1 (internal computation, no cyclic_order tool):
   user      → question
   assistant → tool_call: geocode(place_names)
   tool      → coordinates
-  assistant → "The answer is clockwise/counterclockwise." (with reasoning)
+  assistant → reasoning trace covering all n-2 cross products + final answer
 
-Pipeline 2 (tool-assisted computation):
+Pipeline 2 (tool-assisted computation, one cyclic_order call per assistant turn):
   user      → question
   assistant → tool_call: geocode(place_names)
   tool      → coordinates
-  assistant → tool_call: cyclic_order(center, B, C)
-  tool      → "clockwise" / "counterclockwise"
-  assistant → "The answer is clockwise/counterclockwise."
+  (repeat n-2 times:)
+    assistant → tool_call: cyclic_order(center, B_i, B_{i+1})
+    tool      → "clockwise" / "counterclockwise"
+  assistant → final answer combining the n-2 pairwise results
+
+The train/val split is taken from the input files (no internal shuffling/
+splitting); each input parquet becomes a single output JSONL.
 
 Usage:
     python prepare_data.py \
-        --input data.parquet \
-        --output ./data \
-        --pipeline both \
-        --val_fraction 0.1
+        --train_input        ./data/parquet/spatial_questions_train.parquet \
+        --val_balanced_input ./data/parquet/spatial_questions_val_balanced.parquet \
+        --val_natural_input  ./data/parquet/spatial_questions_val_natural.parquet \
+        --output ./data/jsonl \
+        --pipeline both
 """
 
 from __future__ import annotations
@@ -40,11 +46,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from tools import (
+    CYCLIC_ORDER_SCHEMA,
+    GEOCODE_SCHEMA,
+    build_geocode_result,
+    compute_cyclic_order,
+    representative_point,
+)
 
 
 def _to_native(obj):
@@ -63,61 +75,6 @@ def _to_native(obj):
         return bool(obj)
     return obj
 
-from tools import (
-    CYCLIC_ORDER_SCHEMA,
-    GEOCODE_SCHEMA,
-    build_geocode_result,
-    compute_cyclic_order,
-    representative_point,
-)
-
-
-# ---------------------------------------------------------------------------
-# Role extraction from the dataset
-# ---------------------------------------------------------------------------
-
-
-def _extract_roles(
-    roles_field: dict | list,
-    location_names: list[str],
-) -> tuple[int, int, int] | None:
-    """
-    Extract (center_idx, b_idx, c_idx) from the `roles` column.
-
-    Accepted formats:
-      - dict with keys "center", "b", "c" — values are int indices into
-        location_names, OR string location names that get resolved to indices.
-      - list/tuple of three elements [center, b, c] — same int-or-str rule.
-
-    Returns None if the roles can't be parsed.
-    """
-    if isinstance(roles_field, dict):
-        raw_center = roles_field.get("center")
-        raw_b = roles_field.get("b")
-        raw_c = roles_field.get("c")
-    elif isinstance(roles_field, (list, tuple)) and len(roles_field) == 3:
-        raw_center, raw_b, raw_c = roles_field
-    else:
-        return None
-
-    def _resolve(val: int | str) -> int | None:
-        if isinstance(val, (int, float)):
-            return int(val)
-        if isinstance(val, str):
-            # Match by name
-            lower_names = [n.lower() for n in location_names]
-            if val.lower() in lower_names:
-                return lower_names.index(val.lower())
-        return None
-
-    idx_a = _resolve(raw_center)
-    idx_b = _resolve(raw_b)
-    idx_c = _resolve(raw_c)
-
-    if any(v is None for v in (idx_a, idx_b, idx_c)):
-        return None
-    return (idx_a, idx_b, idx_c)
-
 
 # ---------------------------------------------------------------------------
 # Conversation builders
@@ -134,14 +91,20 @@ def _system_prompt(pipeline: int) -> str:
     if pipeline == 1:
         return base + (
             " Then reason about the coordinates to determine the answer. "
-            "Think step by step: compute the vectors from the center to each "
-            "point, then determine the sign of the cross product to decide "
-            "clockwise vs counterclockwise."
+            "For each consecutive pair of waypoints (B_i, B_{i+1}), compute "
+            "the cross product of the vectors from the center A. The sign "
+            "tells you whether that arc is clockwise or counterclockwise. "
+            "The overall path is clockwise if every arc is clockwise, "
+            "counterclockwise if every arc is counterclockwise, and "
+            "'neither' if the arcs disagree."
         )
     else:
         return base + (
-            " Then use the cyclic_order tool to determine whether the "
-            "arrangement is clockwise or counterclockwise."
+            " Then call the cyclic_order tool once for each consecutive pair "
+            "of waypoints around the center. Combine the per-arc results: "
+            "if every arc is clockwise, the answer is clockwise; if every "
+            "arc is counterclockwise, the answer is counterclockwise; "
+            "otherwise the answer is 'neither'."
         )
 
 
@@ -152,44 +115,69 @@ def _tool_list(pipeline: int) -> list[dict]:
         return [GEOCODE_SCHEMA, CYCLIC_ORDER_SCHEMA]
 
 
+def _fmt_pt(pt: tuple[float, float], digits: int = 2) -> str:
+    return f"({pt[0]:.{digits}f}, {pt[1]:.{digits}f})"
+
+
 def build_conversation_pipeline1(
     question: str,
     location_names: list[str],
     geometries: list[dict],
     answer: str,
-    roles: tuple[int, int, int],
 ) -> list[dict]:
     """
     Build a multi-turn conversation for pipeline 1 (internal computation).
+
+    geometries[0] is the center; geometries[1:] are the ordered waypoints.
     """
-    idx_a, idx_b, idx_c = roles
+    n = len(geometries)
+    assert n >= 3, f"Need at least 3 geometries (1 center + 2 waypoints), got {n}"
+
     geocode_result = build_geocode_result(location_names, geometries)
 
-    # Compute representative points for the reasoning trace
-    pts = {name: representative_point(geom) for name, geom in zip(location_names, geometries)}
-    a_name, b_name, c_name = location_names[idx_a], location_names[idx_b], location_names[idx_c]
-    a_pt, b_pt, c_pt = pts[a_name], pts[b_name], pts[c_name]
+    # Use unrounded points for math (avoids sign-flip rounding edge cases);
+    # display with 2-decimal precision for readability.
+    pts = [representative_point(g) for g in geometries]
+    center_name = location_names[0]
+    center_pt = pts[0]
 
-    a_pt = (round(a_pt[0], 1), round(a_pt[1], 1))
-    b_pt = (round(b_pt[0], 1), round(b_pt[1], 1))
-    c_pt = (round(c_pt[0], 1), round(c_pt[1], 1))
+    lines = ["Let me compute this from the coordinates.\n"]
+    lines.append(f"Center (A): {center_name} at {_fmt_pt(center_pt)}")
+    for i in range(1, n):
+        lines.append(
+            f"Waypoint B{i}: {location_names[i]} at {_fmt_pt(pts[i])}"
+        )
+    lines.append("")
 
-    # Build reasoning trace
-    bx, by = round(b_pt[0] - a_pt[0], 1), round(b_pt[1] - a_pt[1], 1)
-    cx, cy = round(c_pt[0] - a_pt[0], 1), round(c_pt[1] - a_pt[1], 1)
-    det = round(bx * cy - by * cx, 2)
+    arc_labels: list[str] = []
+    for i in range(1, n - 1):
+        b_pt = pts[i]
+        c_pt = pts[i + 1]
+        bx, by = b_pt[0] - center_pt[0], b_pt[1] - center_pt[1]
+        cx, cy = c_pt[0] - center_pt[0], c_pt[1] - center_pt[1]
+        det = bx * cy - by * cx
+        arc = compute_cyclic_order(center_pt, b_pt, c_pt)
+        arc_labels.append(arc)
+        lines.append(
+            f"Arc B{i}→B{i+1} ({location_names[i]} → {location_names[i+1]}): "
+            f"vector A→B{i} = ({bx:.2f}, {by:.2f}), "
+            f"vector A→B{i+1} = ({cx:.2f}, {cy:.2f}), "
+            f"cross = ({bx:.2f})({cy:.2f}) - ({by:.2f})({cx:.2f}) = {det:.2f} → {arc}."
+        )
 
-    reasoning = (
-        f"Let me compute this from the coordinates.\n\n"
-        f"Center (A): {a_name} at ({a_pt[0]}, {a_pt[1]})\n"
-        f"Point B: {b_name} at ({b_pt[0]}, {b_pt[1]})\n"
-        f"Point C: {c_name} at ({c_pt[0]}, {c_pt[1]})\n\n"
-        f"Vector A→B = ({bx}, {by})\n"
-        f"Vector A→C = ({cx}, {cy})\n\n"
-        f"Cross product (determinant) = ({bx})({cy}) - ({by})({cx}) = {det}\n\n"
-        f"Since the determinant is {'positive' if det > 0 else 'negative' if det < 0 else 'zero'}, "
-        f"the arrangement is **{answer}**."
+    lines.append("")
+    if all(a == "clockwise" for a in arc_labels):
+        combined = "clockwise"
+    elif all(a == "counterclockwise" for a in arc_labels):
+        combined = "counterclockwise"
+    else:
+        combined = "neither"
+
+    lines.append(
+        f"All {len(arc_labels)} arcs combined: the path is **{combined}**."
     )
+
+    reasoning = "\n".join(lines)
 
     messages = [
         {"role": "system", "content": _system_prompt(1)},
@@ -213,7 +201,7 @@ def build_conversation_pipeline1(
         },
         {"role": "assistant", "content": reasoning},
     ]
-    return messages
+    return messages, combined
 
 
 def build_conversation_pipeline2(
@@ -221,19 +209,22 @@ def build_conversation_pipeline2(
     location_names: list[str],
     geometries: list[dict],
     answer: str,
-    roles: tuple[int, int, int],
 ) -> list[dict]:
     """
     Build a multi-turn conversation for pipeline 2 (tool-assisted computation).
+
+    One cyclic_order tool call per assistant turn. Final assistant message
+    combines the n-2 pairwise results.
     """
-    idx_a, idx_b, idx_c = roles
+    n = len(geometries)
+    assert n >= 3, f"Need at least 3 geometries (1 center + 2 waypoints), got {n}"
+
     geocode_result = build_geocode_result(location_names, geometries)
+    pts = [representative_point(g) for g in geometries]
+    center_pt = pts[0]
+    center_name = location_names[0]
 
-    pts = {name: representative_point(geom) for name, geom in zip(location_names, geometries)}
-    a_name, b_name, c_name = location_names[idx_a], location_names[idx_b], location_names[idx_c]
-    a_pt, b_pt, c_pt = pts[a_name], pts[b_name], pts[c_name]
-
-    messages = [
+    messages: list[dict] = [
         {"role": "system", "content": _system_prompt(2)},
         {"role": "user", "content": question},
         {
@@ -253,42 +244,82 @@ def build_conversation_pipeline2(
             "name": "geocode",
             "content": json.dumps(geocode_result),
         },
-        {
-            "role": "assistant",
-            "content": (
-                f"I have the coordinates. Let me determine the cyclic order of "
-                f"{b_name} and {c_name} around {a_name}."
-            ),
-            "tool_calls": [
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "cyclic_order",
-                        "arguments": json.dumps(
-                            {
-                                "center": list(a_pt),
-                                "point_b": list(b_pt),
-                                "point_c": list(c_pt),
-                            }
-                        ),
-                    },
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "name": "cyclic_order",
-            "content": json.dumps({"result": answer}),
-        },
-        {
-            "role": "assistant",
-            "content": (
-                f"Based on the coordinates, moving from {b_name} to {c_name} "
-                f"around {a_name} is **{answer}**."
-            ),
-        },
     ]
-    return messages
+
+    arc_labels: list[str] = []
+    for i in range(1, n - 1):
+        b_pt = pts[i]
+        c_pt = pts[i + 1]
+        b_name = location_names[i]
+        c_name = location_names[i + 1]
+        arc = compute_cyclic_order(center_pt, b_pt, c_pt)
+        arc_labels.append(arc)
+
+        if i == 1:
+            preface = (
+                f"I have the coordinates. Let me check the arc from "
+                f"{b_name} to {c_name} around {center_name}."
+            )
+        else:
+            preface = (
+                f"Now checking the arc from {b_name} to {c_name} around "
+                f"{center_name}."
+            )
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": preface,
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "cyclic_order",
+                            "arguments": json.dumps(
+                                {
+                                    "center": list(center_pt),
+                                    "point_b": list(b_pt),
+                                    "point_c": list(c_pt),
+                                }
+                            ),
+                        },
+                    }
+                ],
+            }
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "name": "cyclic_order",
+                "content": json.dumps({"result": arc}),
+            }
+        )
+
+    if all(a == "clockwise" for a in arc_labels):
+        combined = "clockwise"
+    elif all(a == "counterclockwise" for a in arc_labels):
+        combined = "counterclockwise"
+    else:
+        combined = "neither"
+
+    arc_summary = ", ".join(arc_labels)
+    messages.append(
+        {
+            "role": "assistant",
+            "content": (
+                f"The {len(arc_labels)} pairwise arcs around {center_name} are: "
+                f"{arc_summary}. Since "
+                + (
+                    "they all agree"
+                    if combined != "neither"
+                    else "they disagree"
+                )
+                + f", the overall path is **{combined}**."
+            ),
+        }
+    )
+
+    return messages, combined
 
 
 # ---------------------------------------------------------------------------
@@ -296,55 +327,46 @@ def build_conversation_pipeline2(
 # ---------------------------------------------------------------------------
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Prepare training data for geo fine-tuning")
-    parser.add_argument("--input", required=True, help="Path to the parquet file")
-    parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument(
-        "--pipeline",
-        choices=["1", "2", "both"],
-        default="both",
-        help="Which pipeline(s) to generate data for",
-    )
-    parser.add_argument(
-        "--val_fraction", type=float, default=0.1, help="Fraction of data for validation"
-    )
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    args = parser.parse_args()
+REQUIRED_COLS = {"question_id", "question", "location_names", "geometries", "answer"}
 
-    random.seed(args.seed)
-    os.makedirs(args.output, exist_ok=True)
 
-    df = pd.read_parquet(args.input)
-    print(f"Loaded {len(df)} rows from {args.input}")
+def build_records(df: pd.DataFrame, pipeline: str) -> tuple[list[dict], int]:
+    """
+    Build conversation records from a parquet DataFrame.
 
-    # Validate that the 'roles' column exists
-    if "roles" not in df.columns:
-        raise ValueError(
-            "Parquet file must contain a 'roles' column. Each entry should be "
-            "a dict with keys 'center', 'b', 'c' whose values are int indices "
-            "into location_names (or location name strings)."
-        )
-
-    records = []
-    skipped = 0
+    Returns (records, inconsistent_count) where inconsistent_count tracks
+    rows whose synthetic trace's derived label disagreed with the stored
+    `answer`, or rows with malformed geometries.
+    """
+    records: list[dict] = []
+    inconsistent = 0
 
     for _, row in df.iterrows():
         question = row["question"]
         location_names = list(row["location_names"])
-        geometries = list(row["geometries"])
-        answer = row["answer"].strip().lower()
+        geometries = [dict(g) if not isinstance(g, dict) else g for g in row["geometries"]]
+        # `geometries` items may carry numpy arrays for "coordinates"; downstream
+        # code (representative_point) tolerates that, and _to_native fixes it
+        # before JSON serialization.
+        answer = str(row["answer"]).strip().lower()
         qid = int(row["question_id"])
 
-        roles = _extract_roles(row["roles"], location_names)
-        if roles is None:
-            skipped += 1
+        if len(geometries) < 3 or len(location_names) != len(geometries):
+            inconsistent += 1
             continue
 
-        if args.pipeline in ("1", "both"):
-            conv = build_conversation_pipeline1(
-                question, location_names, geometries, answer, roles
+        meta = {
+            "location_names": location_names,
+            "geometries": geometries,
+            "answer": answer,
+        }
+
+        if pipeline in ("1", "both"):
+            conv, derived = build_conversation_pipeline1(
+                question, location_names, geometries, answer
             )
+            if derived != answer:
+                inconsistent += 1
             records.append(
                 {
                     "question_id": qid,
@@ -352,21 +374,16 @@ def main():
                     "tools": _tool_list(1),
                     "messages": conv,
                     "expected_answer": answer,
-                    # Store raw data for RL reward computation
-                    "meta": {
-                        "location_names": location_names,
-                        "geometries": geometries,
-                        "center_idx": roles[0],
-                        "b_idx": roles[1],
-                        "c_idx": roles[2],
-                    },
+                    "meta": meta,
                 }
             )
 
-        if args.pipeline in ("2", "both"):
-            conv = build_conversation_pipeline2(
-                question, location_names, geometries, answer, roles
+        if pipeline in ("2", "both"):
+            conv, derived = build_conversation_pipeline2(
+                question, location_names, geometries, answer
             )
+            if derived != answer:
+                inconsistent += 1
             records.append(
                 {
                     "question_id": qid,
@@ -374,30 +391,78 @@ def main():
                     "tools": _tool_list(2),
                     "messages": conv,
                     "expected_answer": answer,
-                    "meta": {
-                        "location_names": location_names,
-                        "geometries": geometries,
-                        "center_idx": roles[0],
-                        "b_idx": roles[1],
-                        "c_idx": roles[2],
-                    },
+                    "meta": meta,
                 }
             )
 
-    print(f"Generated {len(records)} training conversations ({skipped} rows skipped)")
+    return records, inconsistent
 
-    # Shuffle and split
-    random.shuffle(records)
-    val_size = int(len(records) * args.val_fraction)
-    val_records = records[:val_size]
-    train_records = records[val_size:]
 
-    for split, data in [("train", train_records), ("val", val_records)]:
-        path = os.path.join(args.output, f"{split}.jsonl")
-        with open(path, "w") as f:
-            for rec in data:
-                f.write(json.dumps(_to_native(rec)) + "\n")
-        print(f"Wrote {len(data)} records to {path}")
+def process_split(
+    split_name: str,
+    input_path: str,
+    output_path: str,
+    pipeline: str,
+) -> None:
+    """Read one parquet, build records, write one JSONL."""
+    df = pd.read_parquet(input_path)
+    print(f"[{split_name}] Loaded {len(df)} rows from {input_path}")
+
+    missing = REQUIRED_COLS - set(df.columns)
+    if missing:
+        raise ValueError(
+            f"[{split_name}] parquet missing required columns: {sorted(missing)}. "
+            f"Found columns: {sorted(df.columns)}."
+        )
+
+    records, inconsistent = build_records(df, pipeline)
+    print(f"[{split_name}] Generated {len(records)} conversations")
+    if inconsistent:
+        print(
+            f"  WARNING: {inconsistent} rows where the synthetic trace's "
+            f"derived label disagreed with the stored `answer` (kept the row, "
+            f"trace ends with the derived label). Investigate if this is large."
+        )
+
+    with open(output_path, "w") as f:
+        for rec in records:
+            f.write(json.dumps(_to_native(rec)) + "\n")
+    print(f"[{split_name}] Wrote {len(records)} records to {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Prepare training data for geo fine-tuning")
+    parser.add_argument(
+        "--train_input", required=True,
+        help="Path to the train parquet file",
+    )
+    parser.add_argument(
+        "--val_balanced_input", required=True,
+        help="Path to the balanced validation parquet file",
+    )
+    parser.add_argument(
+        "--val_natural_input", required=True,
+        help="Path to the natural validation parquet file",
+    )
+    parser.add_argument("--output", required=True, help="Output directory")
+    parser.add_argument(
+        "--pipeline",
+        choices=["1", "2", "both"],
+        default="both",
+        help="Which pipeline(s) to generate data for",
+    )
+    args = parser.parse_args()
+
+    os.makedirs(args.output, exist_ok=True)
+
+    splits = [
+        ("train",        args.train_input,        "train.jsonl"),
+        ("val_balanced", args.val_balanced_input, "val_balanced.jsonl"),
+        ("val_natural",  args.val_natural_input,  "val_natural.jsonl"),
+    ]
+    for split_name, input_path, output_filename in splits:
+        output_path = os.path.join(args.output, output_filename)
+        process_split(split_name, input_path, output_path, args.pipeline)
 
 
 if __name__ == "__main__":

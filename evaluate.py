@@ -60,7 +60,12 @@ def main():
     parser.add_argument("--test_file", type=str, required=True)
     parser.add_argument("--pipeline", type=int, default=None,
                         help="Filter to a specific pipeline (1 or 2)")
-    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument(
+        "--max_new_tokens", type=int, default=1024,
+        help="Generation budget per completion. Bumped from 512 to 1024 to "
+             "accommodate up to n-2=8 cyclic_order tool calls in pipeline 2 "
+             "(n=10 worst case).",
+    )
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="0.0 = greedy decoding")
     parser.add_argument("--batch_size", type=int, default=8)
@@ -112,6 +117,10 @@ def main():
     correct = 0
     total = 0
     parse_failures = 0
+    per_class_total: dict[str, int] = {"clockwise": 0, "counterclockwise": 0, "neither": 0}
+    per_class_correct: dict[str, int] = {"clockwise": 0, "counterclockwise": 0, "neither": 0}
+    per_n_total: dict[int, int] = {}
+    per_n_correct: dict[int, int] = {}
 
     for i in range(0, len(records), args.batch_size):
         batch = records[i : i + args.batch_size]
@@ -145,11 +154,19 @@ def main():
 
             predicted = extract_answer(completion)
             ground_truth = compute_ground_truth(record["meta"])
+            n_pts = len(record["meta"]["geometries"])
+
+            if ground_truth in per_class_total:
+                per_class_total[ground_truth] += 1
+            per_n_total[n_pts] = per_n_total.get(n_pts, 0) + 1
 
             if predicted is None:
                 parse_failures += 1
             elif predicted == ground_truth:
                 correct += 1
+                if ground_truth in per_class_correct:
+                    per_class_correct[ground_truth] += 1
+                per_n_correct[n_pts] = per_n_correct.get(n_pts, 0) + 1
 
             total += 1
 
@@ -164,6 +181,19 @@ def main():
     print(f"  Correct:        {correct}")
     print(f"  Accuracy:       {correct / total:.1%}" if total > 0 else "  Accuracy: N/A")
     print(f"  Parse failures: {parse_failures}")
+    print("  Per-class accuracy:")
+    for cls in ("clockwise", "counterclockwise", "neither"):
+        n_cls = per_class_total[cls]
+        c_cls = per_class_correct[cls]
+        if n_cls > 0:
+            print(f"    {cls:18s} {c_cls}/{n_cls} = {c_cls / n_cls:.1%}")
+        else:
+            print(f"    {cls:18s} 0/0 (no examples)")
+    print("  Per-n accuracy (n = number of points = len(geometries)):")
+    for n_pts in sorted(per_n_total.keys()):
+        n_cnt = per_n_total[n_pts]
+        c_cnt = per_n_correct.get(n_pts, 0)
+        print(f"    n={n_pts:<3d}            {c_cnt}/{n_cnt} = {c_cnt / n_cnt:.1%}")
     print("=" * 50)
 
 
