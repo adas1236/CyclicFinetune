@@ -235,7 +235,6 @@ def main():
         save_strategy="steps",
         save_steps=50,
         save_total_limit=3,
-        max_prompt_length=args.max_seq_length,
         max_completion_length=args.max_new_tokens,
         num_generations=args.num_generations,
         deepspeed=args.deepspeed,
