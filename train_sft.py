@@ -268,6 +268,7 @@ def main():
         deepspeed=args.deepspeed,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
+        max_length=args.max_seq_length,
         report_to="wandb" if use_wandb else "none",
         run_name=args.wandb_run_name,
         seed=42,
@@ -285,6 +286,7 @@ def main():
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
+        processing_class=tokenizer,
         peft_config=lora_config,
         callbacks=callbacks,
     )
@@ -300,18 +302,22 @@ def main():
     trainer.train()
 
     # ---- Save ----
-    # Save the LoRA adapter
+    # Save the LoRA adapter. Trainer handles distributed save ownership.
     trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
 
-    # Also save a merged model for easier loading in the RL stage
-    merged_dir = args.output_dir + "-merged"
-    print(f"Merging LoRA adapter and saving to {merged_dir}")
-    merged_model = trainer.model.merge_and_unload()
-    merged_model.save_pretrained(merged_dir)
-    tokenizer.save_pretrained(merged_dir)
+    trainer.accelerator.wait_for_everyone()
+    if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(args.output_dir)
 
-    print("SFT training complete!")
+        # Also save a merged model for easier loading in the RL stage.
+        merged_dir = args.output_dir + "-merged"
+        print(f"Merging LoRA adapter and saving to {merged_dir}")
+        merged_model = trainer.model.merge_and_unload()
+        merged_model.save_pretrained(merged_dir)
+        tokenizer.save_pretrained(merged_dir)
+
+        print("SFT training complete!")
+    trainer.accelerator.wait_for_everyone()
 
 
 if __name__ == "__main__":

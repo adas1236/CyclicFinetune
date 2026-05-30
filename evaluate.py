@@ -19,6 +19,7 @@ import json
 
 import torch
 from peft import PeftModel
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from reward import correctness_reward, extract_answer, compute_ground_truth
@@ -65,6 +66,10 @@ def main():
         help="Generation budget per completion. Bumped from 512 to 1024 to "
              "accommodate up to n-2=8 cyclic_order tool calls in pipeline 2 "
              "(n=10 worst case).",
+    )
+    parser.add_argument(
+        "--max_prompt_length", type=int, default=2048,
+        help="Maximum prompt length before generation.",
     )
     parser.add_argument("--temperature", type=float, default=0.0,
                         help="0.0 = greedy decoding")
@@ -119,10 +124,20 @@ def main():
     parse_failures = 0
     per_class_total: dict[str, int] = {"clockwise": 0, "counterclockwise": 0, "neither": 0}
     per_class_correct: dict[str, int] = {"clockwise": 0, "counterclockwise": 0, "neither": 0}
+    confusion_labels = ["clockwise", "counterclockwise", "neither", "parse_fail"]
+    confusion = {
+        gt: {pred: 0 for pred in confusion_labels}
+        for gt in ("clockwise", "counterclockwise", "neither")
+    }
     per_n_total: dict[int, int] = {}
     per_n_correct: dict[int, int] = {}
 
-    for i in range(0, len(records), args.batch_size):
+    pbar = tqdm(
+        range(0, len(records), args.batch_size),
+        desc="Evaluating",
+        unit="batch",
+    )
+    for i in pbar:
         batch = records[i : i + args.batch_size]
         prompts = [build_prompt(r, tokenizer) for r in batch]
 
@@ -131,7 +146,7 @@ def main():
             return_tensors="pt",
             padding=True,
             truncation=True,
-            max_length=2048,
+            max_length=args.max_prompt_length,
         ).to(model.device)
 
         with torch.no_grad():
@@ -162,17 +177,25 @@ def main():
 
             if predicted is None:
                 parse_failures += 1
+                if ground_truth in confusion:
+                    confusion[ground_truth]["parse_fail"] += 1
             elif predicted == ground_truth:
                 correct += 1
                 if ground_truth in per_class_correct:
                     per_class_correct[ground_truth] += 1
+                if ground_truth in confusion:
+                    confusion[ground_truth][predicted] += 1
                 per_n_correct[n_pts] = per_n_correct.get(n_pts, 0) + 1
+            elif ground_truth in confusion and predicted in confusion[ground_truth]:
+                confusion[ground_truth][predicted] += 1
 
             total += 1
 
-        if (i // args.batch_size + 1) % 10 == 0:
-            print(f"  [{i + len(batch)}/{len(records)}] "
-                  f"Accuracy: {correct}/{total} = {correct / total:.1%}")
+        pbar.set_postfix(
+            acc=f"{correct / total:.1%}" if total else "n/a",
+            correct=f"{correct}/{total}",
+            parse_fail=parse_failures,
+        )
 
     # ---- Results ----
     print("\n" + "=" * 50)
@@ -189,6 +212,11 @@ def main():
             print(f"    {cls:18s} {c_cls}/{n_cls} = {c_cls / n_cls:.1%}")
         else:
             print(f"    {cls:18s} 0/0 (no examples)")
+    print("  Confusion matrix (rows=ground truth, columns=prediction):")
+    print("    " + "".join(f"{label:>18s}" for label in confusion_labels))
+    for gt in ("clockwise", "counterclockwise", "neither"):
+        counts = "".join(f"{confusion[gt][pred]:18d}" for pred in confusion_labels)
+        print(f"    {gt:18s}{counts}")
     print("  Per-n accuracy (n = number of points = len(geometries)):")
     for n_pts in sorted(per_n_total.keys()):
         n_cnt = per_n_total[n_pts]

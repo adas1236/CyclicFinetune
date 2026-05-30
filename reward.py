@@ -19,13 +19,41 @@ from tools import compute_cyclic_order, representative_point
 _VALID_ANSWERS = ("clockwise", "counterclockwise", "neither")
 
 
+_EXPLICIT_ANSWER_RE = re.compile(
+    r"\b(?:final\s+answer|answer|overall\s+(?:path|orientation)|"
+    r"path|orientation|result)\b"
+    r"(?:(?![.!?\n]).){0,120}?\b(neither|counterclockwise|clockwise)\b"
+)
+
+_NEITHER_PHRASE_RE = re.compile(
+    r"\bneither\b(?:(?![.!?\n]).){0,80}\b(?:nor|or)\b"
+    r"(?:(?![.!?\n]).){0,80}\b(?:clockwise|counterclockwise)\b"
+)
+
+_NOT_EITHER_PHRASE_RE = re.compile(
+    r"\bnot\b(?:(?![.!?\n]).){0,80}\b(?:clockwise|counterclockwise)\b"
+    r"(?:(?![.!?\n]).){0,40}\b(?:or|nor)\b"
+    r"(?:(?![.!?\n]).){0,40}\b(?:clockwise|counterclockwise)\b"
+)
+
+
 def extract_answer(text: str) -> str | None:
     """
     Extract 'clockwise', 'counterclockwise', or 'neither' from model output.
     The last keyword to appear in the text wins (so a final answer overrides
     intermediate reasoning). Returns None if none are found.
+
+    A common correct free-form answer is "neither clockwise nor
+    counterclockwise"; the fallback keyword heuristic would otherwise pick
+    "counterclockwise" because it appears last in that phrase.
     """
     text_lower = text.lower()
+
+    explicit_answers = [
+        (m.group(1), m.start(1)) for m in _EXPLICIT_ANSWER_RE.finditer(text_lower)
+    ]
+    if explicit_answers:
+        return max(explicit_answers, key=lambda c: c[1])[0]
 
     ccw_positions = [m.start() for m in re.finditer(r"\bcounterclockwise\b", text_lower)]
     ccw_last = ccw_positions[-1] if ccw_positions else -1
@@ -39,6 +67,8 @@ def extract_answer(text: str) -> str | None:
     cw_last = cw_only_positions[-1] if cw_only_positions else -1
 
     neither_positions = [m.start() for m in re.finditer(r"\bneither\b", text_lower)]
+    neither_positions.extend(m.end() for m in _NEITHER_PHRASE_RE.finditer(text_lower))
+    neither_positions.extend(m.end() for m in _NOT_EITHER_PHRASE_RE.finditer(text_lower))
     neither_last = neither_positions[-1] if neither_positions else -1
 
     candidates = [

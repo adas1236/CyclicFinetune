@@ -20,8 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-from typing import Any
 
 import torch
 from datasets import Dataset
@@ -29,7 +27,7 @@ from peft import LoraConfig, TaskType
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import GRPOConfig, GRPOTrainer
 
-from reward import combined_reward, extract_answer, compute_ground_truth
+from reward import compute_ground_truth, extract_answer
 
 
 def load_jsonl(path: str) -> list[dict]:
@@ -85,38 +83,36 @@ def build_prompts(records: list[dict], tokenizer: AutoTokenizer) -> list[dict]:
     return results
 
 
-def make_reward_fn(metas: list[dict]):
+def make_reward_fn():
     """
     Create a reward function compatible with TRL's GRPOTrainer.
 
-    GRPOTrainer calls reward_fn(completions, prompts=...) where completions
-    is a list of strings.
+    GRPOTrainer passes completions plus any non-prompt dataset columns as
+    keyword arguments. We use a `ground_truth` column so rewards stay aligned
+    after dataloader shuffling and after each prompt is repeated for GRPO's
+    multiple generations.
     """
-    # Build a lookup from prompt index to meta
-    meta_lookup = metas
-
     def reward_fn(completions: list[str], **kwargs) -> list[float]:
-        """
-        Compute rewards for a batch of completions.
+        """Compute correctness + parseability rewards for a batch."""
+        ground_truths = kwargs.get("ground_truth")
+        if ground_truths is None:
+            raise ValueError(
+                "GRPO reward function expected a `ground_truth` dataset column."
+            )
+        if len(ground_truths) != len(completions):
+            raise ValueError(
+                "GRPO reward alignment error: got "
+                f"{len(ground_truths)} ground-truth labels for "
+                f"{len(completions)} completions."
+            )
 
-        When GRPOTrainer generates multiple completions per prompt, they
-        share the same prompt index. We use the prompts kwarg to match back.
-        """
         rewards = []
-        prompts = kwargs.get("prompts", [])
-
-        for i, completion in enumerate(completions):
-            # Find the corresponding meta - GRPOTrainer passes prompts aligned
-            # with completions (one prompt per completion, with repeats for
-            # the group)
-            if i < len(meta_lookup):
-                meta = meta_lookup[i]
+        for completion, ground_truth in zip(completions, ground_truths):
+            predicted = extract_answer(completion)
+            if predicted is None:
+                rewards.append(0.0)
             else:
-                # Wrap around if needed
-                meta = meta_lookup[i % len(meta_lookup)]
-
-            reward = combined_reward(completion, meta)
-            rewards.append(reward)
+                rewards.append(0.25 + (1.0 if predicted == ground_truth else 0.0))
 
         return rewards
 
@@ -172,6 +168,7 @@ def main():
         args.model_name,
         trust_remote_code=True,
         padding_side="left",  # Left-padding for generation
+        model_max_length=args.max_seq_length,
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -209,10 +206,8 @@ def main():
     # The dataset for GRPOTrainer needs a "prompt" column
     dataset = Dataset.from_dict({
         "prompt": [d["prompt"] for d in prompt_data],
+        "ground_truth": [compute_ground_truth(d["meta"]) for d in prompt_data],
     })
-
-    # Store metas separately for the reward function
-    metas = [d["meta"] for d in prompt_data]
 
     # ---- LoRA config ----
     lora_config = LoraConfig(
@@ -240,17 +235,19 @@ def main():
         save_strategy="steps",
         save_steps=50,
         save_total_limit=3,
+        max_prompt_length=args.max_seq_length,
         max_completion_length=args.max_new_tokens,
         num_generations=args.num_generations,
         deepspeed=args.deepspeed,
         gradient_checkpointing=True,
+        remove_unused_columns=False,
         report_to="wandb" if use_wandb else "none",
         run_name=args.wandb_run_name,
         seed=42,
     )
 
     # ---- Reward function ----
-    reward_fn = make_reward_fn(metas)
+    reward_fn = make_reward_fn()
 
     # ---- Trainer ----
     trainer = GRPOTrainer(
@@ -258,6 +255,7 @@ def main():
         args=training_args,
         train_dataset=dataset,
         reward_funcs=reward_fn,
+        processing_class=tokenizer,
         peft_config=lora_config,
     )
 
