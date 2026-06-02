@@ -113,6 +113,63 @@ def compute_cyclic_order(
         return "clockwise"
 
 
+def lonlat_to_unit_vector(point: tuple[float, float]) -> tuple[float, float, float]:
+    """
+    Convert a [longitude, latitude] point in degrees to an Earth-centered unit vector.
+    """
+    lon_deg, lat_deg = point
+    lon = math.radians(lon_deg)
+    lat = math.radians(lat_deg)
+    cos_lat = math.cos(lat)
+    return (
+        cos_lat * math.cos(lon),
+        cos_lat * math.sin(lon),
+        math.sin(lat),
+    )
+
+
+def _cross3(
+    u: tuple[float, float, float],
+    v: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    return (
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    )
+
+
+def _dot3(
+    u: tuple[float, float, float],
+    v: tuple[float, float, float],
+) -> float:
+    return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]
+
+
+def compute_cyclic_order_earth(
+    center: tuple[float, float],
+    point_b: tuple[float, float],
+    point_c: tuple[float, float],
+    *,
+    eps: float = 1e-12,
+) -> str:
+    """
+    Compute spherical cyclic order using det([A, B, C]) on unit Earth vectors.
+
+    Arguments use the same model-facing convention as cyclic_order:
+    [longitude, latitude]. The sign convention matches compute_cyclic_order near
+    the equator: east-to-north around [0, 0] is counterclockwise.
+    """
+    a = lonlat_to_unit_vector(center)
+    b = lonlat_to_unit_vector(point_b)
+    c = lonlat_to_unit_vector(point_c)
+    det = _dot3(a, _cross3(b, c))
+    if det > eps:
+        return "counterclockwise"
+    else:
+        return "clockwise"
+
+
 def representative_point(geometry: dict) -> tuple[float, float]:
     """
     Extract a single representative (x, y) point from a geometry dict.
@@ -145,6 +202,22 @@ def representative_point(geometry: dict) -> tuple[float, float]:
         xs = [c[0] for c in coords]
         ys = [c[1] for c in coords]
         return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def representative_point_lonlat(
+    geometry: dict,
+    input_coord_order: str = "lonlat",
+) -> tuple[float, float]:
+    """
+    Extract a representative point and normalize it to [longitude, latitude].
+    """
+    raw_x, raw_y = representative_point(geometry)
+    if input_coord_order == "lonlat":
+        return (raw_x, raw_y)
+    if input_coord_order == "latlon":
+        lat, lon = raw_x, raw_y
+        return (lon, lat)
+    raise ValueError(f"Unknown input_coord_order={input_coord_order!r}")
 
 
 # ---------------------------------------------------------------------------

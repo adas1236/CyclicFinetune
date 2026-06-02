@@ -10,3 +10,5 @@ geometries.json
 .gradio/
 *.md
 gradio_tmp
+scratch.py
+secrets.env

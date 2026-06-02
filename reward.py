@@ -13,7 +13,11 @@ from __future__ import annotations
 
 import re
 
-from tools import compute_cyclic_order, representative_point
+from tools import (
+    compute_cyclic_order,
+    compute_cyclic_order_earth,
+    representative_point_lonlat,
+)
 
 
 _VALID_ANSWERS = ("clockwise", "counterclockwise", "neither")
@@ -93,7 +97,12 @@ def _combine_arcs(arc_labels: list[str]) -> str:
     return "neither"
 
 
-def compute_ground_truth(meta: dict) -> str:
+def compute_ground_truth(
+    meta: dict,
+    *,
+    earth: bool = False,
+    input_coord_order: str = "lonlat",
+) -> str:
     """
     Return the ground-truth answer for a record's metadata.
 
@@ -113,10 +122,14 @@ def compute_ground_truth(meta: dict) -> str:
             f"meta['geometries'] must have length >= 3, got {len(geometries)}"
         )
 
-    pts = [representative_point(g) for g in geometries]
+    pts = [
+        representative_point_lonlat(g, input_coord_order=input_coord_order)
+        for g in geometries
+    ]
     center = pts[0]
+    cyclic_order_fn = compute_cyclic_order_earth if earth else compute_cyclic_order
     arcs = [
-        compute_cyclic_order(center, pts[i], pts[i + 1])
+        cyclic_order_fn(center, pts[i], pts[i + 1])
         for i in range(1, len(pts) - 1)
     ]
     return _combine_arcs(arcs)
