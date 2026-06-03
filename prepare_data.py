@@ -30,16 +30,13 @@ Pipeline 2 (tool-assisted computation, one cyclic_order call per assistant turn)
   assistant → final answer combining the n-2 pairwise results
 
 The train/val split is taken from the input files (no internal shuffling/
-splitting); each input parquet becomes a single output JSONL.
+splitting); each input parquet that is provided becomes a single output JSONL.
 
 Usage:
     python prepare_data.py \
-        --train_input        ./data/parquet/spatial_questions_train.parquet \
-        --val_balanced_input ./data/parquet/spatial_questions_val_balanced.parquet \
-        --val_natural_input  ./data/parquet/spatial_questions_val_natural.parquet \
         --val_earth_input    ./data/parquet/earth_cyclic_order.parquet \
         --output ./data/jsonl \
-        --pipeline both
+        --pipeline 2
 
 The train, val_balanced, and val_natural inputs are synthetic planar data.
 If --val_earth_input is provided, it is written as val_earth.jsonl using the
@@ -602,16 +599,19 @@ def process_split(
 def main():
     parser = argparse.ArgumentParser(description="Prepare training data for geo fine-tuning")
     parser.add_argument(
-        "--train_input", required=True,
-        help="Path to the train parquet file",
+        "--train_input",
+        default=None,
+        help="Optional path to the train parquet file",
     )
     parser.add_argument(
-        "--val_balanced_input", required=True,
-        help="Path to the balanced validation parquet file",
+        "--val_balanced_input",
+        default=None,
+        help="Optional path to the balanced validation parquet file",
     )
     parser.add_argument(
-        "--val_natural_input", required=True,
-        help="Path to the natural validation parquet file",
+        "--val_natural_input",
+        default=None,
+        help="Optional path to the natural validation parquet file",
     )
     parser.add_argument(
         "--val_earth_input",
@@ -640,13 +640,29 @@ def main():
     )
     args = parser.parse_args()
 
-    os.makedirs(args.output, exist_ok=True)
-
-    splits = [
-        ("train",        args.train_input,        "train.jsonl",        False, "lonlat"),
-        ("val_balanced", args.val_balanced_input, "val_balanced.jsonl", False, "lonlat"),
-        ("val_natural",  args.val_natural_input,  "val_natural.jsonl",  False, "lonlat"),
-    ]
+    splits = []
+    if args.train_input:
+        splits.append(("train", args.train_input, "train.jsonl", False, "lonlat"))
+    if args.val_balanced_input:
+        splits.append(
+            (
+                "val_balanced",
+                args.val_balanced_input,
+                "val_balanced.jsonl",
+                False,
+                "lonlat",
+            )
+        )
+    if args.val_natural_input:
+        splits.append(
+            (
+                "val_natural",
+                args.val_natural_input,
+                "val_natural.jsonl",
+                False,
+                "lonlat",
+            )
+        )
     if args.val_earth_input:
         splits.append(
             (
@@ -657,9 +673,16 @@ def main():
                 args.val_earth_coord_order,
             )
         )
+    if not splits:
+        parser.error(
+            "At least one input must be provided: --train_input, "
+            "--val_balanced_input, --val_natural_input, or --val_earth_input."
+        )
+
+    os.makedirs(args.output, exist_ok=True)
 
     for split_name, input_path, output_filename, earth, input_coord_order in splits:
-        output_path = os.path.join(args.output, output_filename)
+        output_path = os.path.join(args.output, args.pipeline, output_filename)
         process_split(
             split_name,
             input_path,

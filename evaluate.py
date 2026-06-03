@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,6 +38,40 @@ class ParsedAssistantTurn:
     content: str
     tool_calls: list[dict]
     parse_error: str | None = None
+
+
+@dataclass
+class GenerationResult:
+    raw: str
+    clean: str
+    prompt_tokens: int
+    generated_tokens: int
+    hit_token_cap: bool
+    tokenization_seconds: float = 0.0
+    generation_seconds: float = 0.0
+
+
+@dataclass
+class LiveEvalState:
+    index: int
+    record: dict
+    tools: list[dict]
+    messages: list[dict]
+    metrics: dict[str, int]
+    turns: int = 0
+    status: str | None = None
+    completion: str = ""
+    predicted: str | None = None
+    error: str | None = None
+    prompt_tokens_total: int = 0
+    generated_tokens_total: int = 0
+    prompt_render_seconds: float = 0.0
+    tokenization_seconds: float = 0.0
+    generation_seconds: float = 0.0
+    parsing_seconds: float = 0.0
+    tool_execution_seconds: float = 0.0
+    truncation_retries: int = 0
+    truncation_retry_successes: int = 0
 
 
 class ToolExecutionError(ValueError):
@@ -259,6 +294,115 @@ def clean_parsed_content(text: str) -> str:
     return text.strip()
 
 
+def _match_braces(text: str, start: int) -> int:
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if esc:
+            esc = False
+            continue
+        if c == "\\" and in_str:
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
+def discover_tool_markers(tokenizer: AutoTokenizer, tools: list[dict]) -> tuple[str, str] | None:
+    """Infer the tokenizer's tool-call wrapper from its chat template."""
+    sentinel_tool = "ZZPROBETOOL"
+    sentinel_text = "ZZPROBETXT"
+
+    probe_tool = [
+        {"role": "user", "content": "u"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "probe0",
+                    "type": "function",
+                    "function": {
+                        "name": sentinel_tool,
+                        "arguments": json.dumps({"k": 1}),
+                    },
+                }
+            ],
+        },
+    ]
+    probe_text = [
+        {"role": "user", "content": "u"},
+        {"role": "assistant", "content": sentinel_text},
+    ]
+
+    def render(msgs: list[dict]) -> str | None:
+        try:
+            return tokenizer.apply_chat_template(
+                msgs,
+                tools=tools,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        except Exception:
+            try:
+                return tokenizer.apply_chat_template(
+                    msgs,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            except Exception:
+                return None
+
+    rendered_tool = render(probe_tool)
+    rendered_text = render(probe_text)
+    if rendered_tool is None or rendered_text is None:
+        return None
+    if sentinel_tool not in rendered_tool or sentinel_text not in rendered_text:
+        return None
+
+    pre_len = 0
+    n = min(len(rendered_tool), len(rendered_text))
+    while pre_len < n and rendered_tool[pre_len] == rendered_text[pre_len]:
+        pre_len += 1
+
+    suf_len = 0
+    while (
+        suf_len < len(rendered_tool) - pre_len
+        and suf_len < len(rendered_text) - pre_len
+        and rendered_tool[-1 - suf_len] == rendered_text[-1 - suf_len]
+    ):
+        suf_len += 1
+
+    diverged = rendered_tool[pre_len : len(rendered_tool) - suf_len]
+    sent_pos = diverged.find(sentinel_tool)
+    if sent_pos == -1:
+        return None
+    json_start = diverged.rfind("{", 0, sent_pos)
+    if json_start == -1:
+        return None
+    json_end = _match_braces(diverged, json_start)
+    if json_end == -1:
+        return None
+
+    prefix = diverged[:json_start]
+    suffix = diverged[json_end:]
+    if not prefix and not suffix:
+        return None
+    return prefix, suffix
+
+
 def normalize_tool_call(obj: Any) -> dict | None:
     if not isinstance(obj, dict):
         return None
@@ -467,6 +611,103 @@ def materialize_prefilled_messages_from_meta(
     return messages
 
 
+def get_model_input_device(model) -> torch.device | str:
+    device = getattr(model, "device", None)
+    if device is not None:
+        return device
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
+def cuda_synchronize_if_available() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def generate_batch(
+    model,
+    tokenizer: AutoTokenizer,
+    prompts: list[str],
+    *,
+    max_prompt_length: int,
+    max_new_tokens: int,
+    temperature: float,
+    stop_strings: list[str] | None = None,
+) -> list[GenerationResult]:
+    tokenization_start = time.perf_counter()
+    inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=max_prompt_length,
+    ).to(get_model_input_device(model))
+    tokenization_seconds = time.perf_counter() - tokenization_start
+
+    gen_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "do_sample": temperature > 0,
+        "pad_token_id": tokenizer.pad_token_id,
+    }
+    if temperature > 0:
+        gen_kwargs["temperature"] = temperature
+    if stop_strings:
+        gen_kwargs["stop_strings"] = stop_strings
+        gen_kwargs["tokenizer"] = tokenizer
+
+    with torch.no_grad():
+        cuda_synchronize_if_available()
+        generation_start = time.perf_counter()
+        try:
+            outputs = model.generate(**inputs, **gen_kwargs)
+        except TypeError:
+            if not stop_strings:
+                raise
+            if not getattr(generate_batch, "_warned_stop_strings_failure", False):
+                print(
+                    "WARNING: model.generate rejected stop_strings; "
+                    "continuing without tool-call stop strings."
+                )
+                setattr(generate_batch, "_warned_stop_strings_failure", True)
+            fallback_kwargs = dict(gen_kwargs)
+            fallback_kwargs.pop("stop_strings", None)
+            fallback_kwargs.pop("tokenizer", None)
+            outputs = model.generate(**inputs, **fallback_kwargs)
+        cuda_synchronize_if_available()
+        generation_seconds = time.perf_counter() - generation_start
+
+    prompt_len = inputs["input_ids"].shape[1]
+    generated = outputs[:, prompt_len:]
+    per_row_tokenization = tokenization_seconds / len(prompts) if prompts else 0.0
+    per_row_generation = generation_seconds / len(prompts) if prompts else 0.0
+    pad_token_id = tokenizer.pad_token_id
+
+    results: list[GenerationResult] = []
+    for row_idx in range(len(prompts)):
+        row = generated[row_idx]
+        if pad_token_id is None:
+            generated_tokens = int(row.numel())
+        else:
+            generated_tokens = int((row != pad_token_id).sum().item())
+        raw = tokenizer.decode(row, skip_special_tokens=False)
+        clean = tokenizer.decode(row, skip_special_tokens=True)
+        results.append(
+            GenerationResult(
+                raw=raw,
+                clean=clean,
+                prompt_tokens=int(inputs["attention_mask"][row_idx].sum().item()),
+                generated_tokens=generated_tokens,
+                hit_token_cap=generated_tokens >= max_new_tokens,
+                tokenization_seconds=per_row_tokenization,
+                generation_seconds=per_row_generation,
+            )
+        )
+
+    return results
+
+
 def generate_one(
     model,
     tokenizer: AutoTokenizer,
@@ -476,29 +717,15 @@ def generate_one(
     max_new_tokens: int,
     temperature: float,
 ) -> tuple[str, str]:
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_prompt_length,
-    ).to(model.device)
-
-    gen_kwargs = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": temperature > 0,
-        "pad_token_id": tokenizer.pad_token_id,
-    }
-    if temperature > 0:
-        gen_kwargs["temperature"] = temperature
-
-    with torch.no_grad():
-        outputs = model.generate(**inputs, **gen_kwargs)
-
-    prompt_len = inputs["input_ids"].shape[1]
-    generated = outputs[0][prompt_len:]
-    raw = tokenizer.decode(generated, skip_special_tokens=False)
-    clean = tokenizer.decode(generated, skip_special_tokens=True)
-    return raw, clean
+    result = generate_batch(
+        model,
+        tokenizer,
+        [prompt],
+        max_prompt_length=max_prompt_length,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+    )[0]
+    return result.raw, result.clean
 
 
 def new_live_metrics() -> dict[str, int]:
@@ -509,7 +736,352 @@ def new_live_metrics() -> dict[str, int]:
         "geocode_calls": 0,
         "cyclic_order_calls": 0,
         "tool_error_returns": 0,
+        "truncation_retries": 0,
+        "truncation_retry_successes": 0,
     }
+
+
+def stable_tools_key(tools: list[dict]) -> str:
+    return json.dumps(tools, sort_keys=True, separators=(",", ":"))
+
+
+def chunks(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def init_live_state(index: int, record: dict) -> LiveEvalState:
+    return LiveEvalState(
+        index=index,
+        record=record,
+        tools=get_eval_tools(record),
+        messages=[dict(record["messages"][0]), dict(record["messages"][1])],
+        metrics=new_live_metrics(),
+    )
+
+
+def build_live_prompt(state: LiveEvalState, tokenizer: AutoTokenizer) -> str:
+    start = time.perf_counter()
+    prompt = apply_chat_template_with_tools(state.messages, state.tools, tokenizer)
+    state.prompt_render_seconds += time.perf_counter() - start
+    return prompt
+
+
+def record_generation_timing(state: LiveEvalState, result: GenerationResult) -> None:
+    state.prompt_tokens_total += result.prompt_tokens
+    state.generated_tokens_total += result.generated_tokens
+    state.tokenization_seconds += result.tokenization_seconds
+    state.generation_seconds += result.generation_seconds
+
+
+def has_unclosed_tool_marker(
+    text: str,
+    *,
+    prefix_marker: str | None,
+    suffix_marker: str | None,
+) -> bool:
+    checks = []
+    if prefix_marker:
+        checks.append((prefix_marker.strip() or prefix_marker, suffix_marker))
+    checks.append(("<tool_call>", "</tool_call>"))
+
+    for prefix, suffix in checks:
+        if not prefix or prefix not in text:
+            continue
+        if not suffix:
+            return True
+        prefix_idx = text.rfind(prefix)
+        suffix_idx = text.find(suffix, prefix_idx + len(prefix))
+        if suffix_idx == -1:
+            return True
+    return False
+
+
+def has_unclosed_json_object(text: str) -> bool:
+    starts = [pos for pos in (text.rfind("{"), text.rfind("[")) if pos >= 0]
+    if not starts:
+        return False
+    start = max(starts)
+    if text[start] == "{":
+        return _match_braces(text, start) == -1
+
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if esc:
+            esc = False
+            continue
+        if c == "\\" and in_str:
+            esc = True
+            continue
+        if c == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return False
+    return True
+
+
+def generation_has_parseable_step(result: GenerationResult) -> bool:
+    parsed = extract_tool_calls_from_completion(result.raw)
+    return bool(parsed.tool_calls) or extract_answer(result.clean) is not None
+
+
+def looks_like_truncated_generation(
+    result: GenerationResult,
+    *,
+    prefix_marker: str | None,
+    suffix_marker: str | None,
+) -> bool:
+    if not result.hit_token_cap:
+        return False
+    if generation_has_parseable_step(result):
+        return False
+
+    raw = result.raw
+    lower = raw.lower()
+    if has_unclosed_tool_marker(
+        raw,
+        prefix_marker=prefix_marker,
+        suffix_marker=suffix_marker,
+    ):
+        return True
+    if has_unclosed_json_object(raw) and (
+        "tool_call" in lower
+        or "arguments" in lower
+        or "function" in lower
+        or '"name"' in lower
+    ):
+        return True
+    if extract_tool_calls_from_completion(raw).parse_error:
+        return True
+
+    clean = result.clean.strip()
+    return bool(clean) and clean[-1] not in ".!?)]}\"'"
+
+
+def advance_live_state(
+    state: LiveEvalState,
+    result: GenerationResult,
+    *,
+    earth: bool,
+    input_coord_order: str,
+    max_tool_turns: int,
+    tool_error_policy: str,
+) -> None:
+    state.turns += 1
+    state.completion = result.clean
+
+    parse_start = time.perf_counter()
+    parsed = extract_tool_calls_from_completion(result.raw)
+    state.parsing_seconds += time.perf_counter() - parse_start
+    if parsed.parse_error:
+        state.metrics["tool_parse_failures"] += 1
+
+    if parsed.tool_calls:
+        assistant_msg = {
+            "role": "assistant",
+            "tool_calls": parsed.tool_calls,
+        }
+        if parsed.content:
+            assistant_msg["content"] = parsed.content
+        state.messages.append(assistant_msg)
+
+        try:
+            for call in parsed.tool_calls:
+                tool_start = time.perf_counter()
+                tool_result = execute_tool_call(
+                    call,
+                    state.record,
+                    earth=earth,
+                    input_coord_order=input_coord_order,
+                    tool_error_policy=tool_error_policy,
+                    metrics=state.metrics,
+                )
+                state.tool_execution_seconds += time.perf_counter() - tool_start
+                function = call.get("function") if isinstance(call, dict) else None
+                tool_name = (
+                    function.get("name")
+                    if isinstance(function, dict) and isinstance(function.get("name"), str)
+                    else "unknown"
+                )
+                state.messages.append(
+                    {
+                        "role": "tool",
+                        "name": tool_name,
+                        "content": json.dumps(tool_result),
+                    }
+                )
+        except ToolExecutionError as exc:
+            state.status = "tool_failure"
+            state.error = str(exc)
+            state.predicted = None
+            return
+
+        if state.turns >= max_tool_turns:
+            state.status = "max_tool_turns"
+            state.error = "maximum live tool turns reached"
+        return
+
+    final_message = {"role": "assistant", "content": result.clean}
+    state.messages.append(final_message)
+    if parsed.parse_error:
+        state.status = "tool_parse_fail"
+        state.error = parsed.parse_error
+        state.predicted = None
+        return
+
+    state.predicted = extract_answer(result.clean)
+    state.status = "ok" if state.predicted is not None else "parse_fail"
+    state.error = None
+
+
+def finalize_live_state(state: LiveEvalState) -> dict:
+    return {
+        "completion": state.completion,
+        "predicted": state.predicted,
+        "messages": state.messages,
+        "status": state.status or "unknown",
+        "turns": state.turns,
+        "metrics": state.metrics,
+        "error": state.error,
+        "n_points": len(state.record["meta"]["geometries"]),
+        "timing": {
+            "prompt_render_seconds": state.prompt_render_seconds,
+            "tokenization_seconds": state.tokenization_seconds,
+            "generation_seconds": state.generation_seconds,
+            "parsing_seconds": state.parsing_seconds,
+            "tool_execution_seconds": state.tool_execution_seconds,
+            "prompt_tokens": state.prompt_tokens_total,
+            "generated_tokens": state.generated_tokens_total,
+            "truncation_retries": state.truncation_retries,
+            "truncation_retry_successes": state.truncation_retry_successes,
+        },
+    }
+
+
+def evaluate_records_live_batched(
+    records: list[dict],
+    model,
+    tokenizer: AutoTokenizer,
+    *,
+    batch_size: int,
+    earth: bool,
+    input_coord_order: str,
+    max_tool_turns: int,
+    max_prompt_length: int,
+    max_new_tokens: int,
+    retry_max_new_tokens: int,
+    temperature: float,
+    tool_error_policy: str,
+    stop_strings: list[str] | None,
+    prefix_marker: str | None,
+    suffix_marker: str | None,
+) -> tuple[list[dict], dict[str, float | int]]:
+    states = [init_live_state(i, record) for i, record in enumerate(records)]
+    active = list(states)
+    results_by_index: list[dict | None] = [None] * len(records)
+    frontier_stats: dict[str, float | int] = {
+        "frontier_batches": 0,
+        "frontier_batch_seconds": 0.0,
+    }
+
+    pbar = tqdm(total=len(records), desc="Evaluating", unit="example")
+    try:
+        while active:
+            next_active: list[LiveEvalState] = []
+            grouped: dict[str, list[LiveEvalState]] = {}
+            for state in active:
+                grouped.setdefault(stable_tools_key(state.tools), []).append(state)
+
+            for group in grouped.values():
+                for batch in chunks(group, batch_size):
+                    batch_start = time.perf_counter()
+                    prompts = [build_live_prompt(state, tokenizer) for state in batch]
+                    generation_results = generate_batch(
+                        model,
+                        tokenizer,
+                        prompts,
+                        max_prompt_length=max_prompt_length,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        stop_strings=stop_strings,
+                    )
+                    for state, result in zip(batch, generation_results):
+                        record_generation_timing(state, result)
+
+                    retry_items: list[tuple[int, LiveEvalState]] = []
+                    if max_new_tokens < retry_max_new_tokens:
+                        for result_idx, (state, result) in enumerate(
+                            zip(batch, generation_results)
+                        ):
+                            if looks_like_truncated_generation(
+                                result,
+                                prefix_marker=prefix_marker,
+                                suffix_marker=suffix_marker,
+                            ):
+                                state.truncation_retries += 1
+                                state.metrics["truncation_retries"] += 1
+                                retry_items.append((result_idx, state))
+
+                    if retry_items:
+                        retry_prompts = [prompts[result_idx] for result_idx, _ in retry_items]
+                        retry_results = generate_batch(
+                            model,
+                            tokenizer,
+                            retry_prompts,
+                            max_prompt_length=max_prompt_length,
+                            max_new_tokens=retry_max_new_tokens,
+                            temperature=temperature,
+                            stop_strings=stop_strings,
+                        )
+                        for retry_result, (result_idx, state) in zip(
+                            retry_results,
+                            retry_items,
+                        ):
+                            record_generation_timing(state, retry_result)
+                            if generation_has_parseable_step(retry_result):
+                                state.truncation_retry_successes += 1
+                                state.metrics["truncation_retry_successes"] += 1
+                            generation_results[result_idx] = retry_result
+
+                    for state, result in zip(batch, generation_results):
+                        advance_live_state(
+                            state,
+                            result,
+                            earth=earth,
+                            input_coord_order=input_coord_order,
+                            max_tool_turns=max_tool_turns,
+                            tool_error_policy=tool_error_policy,
+                        )
+                        if state.status is None:
+                            next_active.append(state)
+                        else:
+                            results_by_index[state.index] = finalize_live_state(state)
+                            pbar.update(1)
+
+                    frontier_stats["frontier_batches"] = int(frontier_stats["frontier_batches"]) + 1
+                    frontier_stats["frontier_batch_seconds"] = (
+                        float(frontier_stats["frontier_batch_seconds"])
+                        + time.perf_counter()
+                        - batch_start
+                    )
+
+            active = next_active
+    finally:
+        pbar.close()
+
+    missing = [i for i, result in enumerate(results_by_index) if result is None]
+    if missing:
+        raise RuntimeError(f"live evaluation did not finalize result(s): {missing}")
+    return [result for result in results_by_index if result is not None], frontier_stats
 
 
 def evaluate_record_live(
@@ -682,7 +1254,94 @@ def prediction_row(
         row["tool_metrics"] = live_result["metrics"]
         row["turns"] = live_result["turns"]
         row["error"] = live_result.get("error")
+        row["timing"] = live_result.get("timing")
     return row
+
+
+def safe_div(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def aggregate_live_timings(
+    live_results: list[dict],
+    *,
+    live_total_seconds: float,
+    frontier_stats: dict[str, float | int],
+) -> dict[str, Any]:
+    total_turns = sum(int(result.get("turns", 0)) for result in live_results)
+    total_tool_calls = 0
+    prompt_render_seconds = 0.0
+    tokenization_seconds = 0.0
+    generation_seconds = 0.0
+    parsing_seconds = 0.0
+    tool_execution_seconds = 0.0
+    prompt_tokens = 0
+    generated_tokens = 0
+    truncation_retries = 0
+    truncation_retry_successes = 0
+    seconds_by_n: dict[int, list[float]] = {}
+
+    for result in live_results:
+        metrics = result.get("metrics", {})
+        total_tool_calls += int(metrics.get("geocode_calls", 0))
+        total_tool_calls += int(metrics.get("cyclic_order_calls", 0))
+        timing = result.get("timing") or {}
+        prompt_render_seconds += float(timing.get("prompt_render_seconds", 0.0))
+        tokenization_seconds += float(timing.get("tokenization_seconds", 0.0))
+        generation_seconds += float(timing.get("generation_seconds", 0.0))
+        parsing_seconds += float(timing.get("parsing_seconds", 0.0))
+        tool_execution_seconds += float(timing.get("tool_execution_seconds", 0.0))
+        prompt_tokens += int(timing.get("prompt_tokens", 0))
+        generated_tokens += int(timing.get("generated_tokens", 0))
+        truncation_retries += int(timing.get("truncation_retries", 0))
+        truncation_retry_successes += int(timing.get("truncation_retry_successes", 0))
+        n_points = int(result.get("n_points", 0))
+        state_seconds = (
+            float(timing.get("prompt_render_seconds", 0.0))
+            + float(timing.get("tokenization_seconds", 0.0))
+            + float(timing.get("generation_seconds", 0.0))
+            + float(timing.get("parsing_seconds", 0.0))
+            + float(timing.get("tool_execution_seconds", 0.0))
+        )
+        seconds_by_n.setdefault(n_points, []).append(state_seconds)
+
+    avg_seconds_by_n = {
+        n_points: safe_div(sum(values), len(values))
+        for n_points, values in seconds_by_n.items()
+    }
+    frontier_batches = int(frontier_stats.get("frontier_batches", 0))
+    frontier_batch_seconds = float(frontier_stats.get("frontier_batch_seconds", 0.0))
+
+    return {
+        "total_turns": total_turns,
+        "total_tool_calls": total_tool_calls,
+        "avg_seconds_per_example": safe_div(live_total_seconds, len(live_results)),
+        "avg_seconds_per_turn": safe_div(live_total_seconds, total_turns),
+        "avg_seconds_per_tool_call": safe_div(live_total_seconds, total_tool_calls),
+        "avg_seconds_by_n": avg_seconds_by_n,
+        "avg_generated_tokens_per_turn": safe_div(generated_tokens, total_turns),
+        "avg_prompt_tokens_per_turn": safe_div(prompt_tokens, total_turns),
+        "avg_generation_seconds_per_turn": safe_div(generation_seconds, total_turns),
+        "avg_tool_execution_seconds_per_tool_call": safe_div(
+            tool_execution_seconds,
+            total_tool_calls,
+        ),
+        "prompt_render_seconds": prompt_render_seconds,
+        "tokenization_seconds": tokenization_seconds,
+        "generation_seconds": generation_seconds,
+        "parsing_seconds": parsing_seconds,
+        "tool_execution_seconds": tool_execution_seconds,
+        "prompt_tokens": prompt_tokens,
+        "generated_tokens": generated_tokens,
+        "truncation_retries": truncation_retries,
+        "truncation_retry_successes": truncation_retry_successes,
+        "frontier_batches": frontier_batches,
+        "frontier_batch_seconds": frontier_batch_seconds,
+        "avg_seconds_per_frontier_batch": safe_div(
+            frontier_batch_seconds,
+            frontier_batches,
+        ),
+    }
 
 
 def print_results(
@@ -692,7 +1351,9 @@ def print_results(
     tool_mode: str,
     earth: bool,
     input_coord_order: str,
+    timing: dict[str, float] | None = None,
     live_counts: dict[str, int] | None = None,
+    live_timings: dict[str, Any] | None = None,
     live_turns_sum: int = 0,
     live_cyclic_sum: int = 0,
 ) -> None:
@@ -730,6 +1391,18 @@ def print_results(
         c_cnt = score["per_n_correct"].get(n_pts, 0)
         print(f"    n={n_pts:<3d}            {c_cnt}/{n_cnt} = {c_cnt / n_cnt:.1%}")
 
+    if timing is not None:
+        print("  Timing:")
+        print(f"    timing/total_seconds: {timing.get('total_seconds', 0.0):.3f}")
+        print(
+            "    timing/avg_seconds_per_sample: "
+            f"{timing.get('avg_seconds_per_sample', 0.0):.3f}"
+        )
+        print(
+            "    timing/samples_per_second: "
+            f"{timing.get('samples_per_second', 0.0):.3f}"
+        )
+
     if live_counts is not None:
         print("  Live tool metrics:")
         for key in (
@@ -739,6 +1412,8 @@ def print_results(
             "geocode_calls",
             "cyclic_order_calls",
             "tool_error_returns",
+            "truncation_retries",
+            "truncation_retry_successes",
             "max_tool_turn_failures",
             "tool_failure_examples",
         ):
@@ -747,6 +1422,35 @@ def print_results(
         avg_cyclic = live_cyclic_sum / total if total else 0.0
         print(f"    live/avg_turns: {avg_turns:.2f}")
         print(f"    live/avg_cyclic_order_calls_per_example: {avg_cyclic:.2f}")
+    if live_timings is not None:
+        print("  Live timing:")
+        for key in (
+            "total_turns",
+            "total_tool_calls",
+            "avg_seconds_per_example",
+            "avg_seconds_per_turn",
+            "avg_seconds_per_tool_call",
+            "avg_generated_tokens_per_turn",
+            "avg_prompt_tokens_per_turn",
+            "avg_generation_seconds_per_turn",
+            "avg_tool_execution_seconds_per_tool_call",
+            "frontier_batches",
+            "avg_seconds_per_frontier_batch",
+            "truncation_retries",
+            "truncation_retry_successes",
+        ):
+            value = live_timings.get(key, 0)
+            if isinstance(value, float):
+                print(f"    live/{key}: {value:.3f}")
+            else:
+                print(f"    live/{key}: {value}")
+        avg_seconds_by_n = live_timings.get("avg_seconds_by_n", {})
+        if avg_seconds_by_n:
+            formatted = ", ".join(
+                f"n={n}:{avg_seconds_by_n[n]:.3f}s"
+                for n in sorted(avg_seconds_by_n)
+            )
+            print(f"    live/avg_seconds_by_n: {formatted}")
     print("=" * 50)
 
 
@@ -773,6 +1477,13 @@ def main():
         help="Generation budget per completion. Bumped from 512 to 1024 to "
              "accommodate up to n-2=8 cyclic_order tool calls in pipeline 2 "
              "(n=10 worst case).",
+    )
+    parser.add_argument(
+        "--live_max_new_tokens",
+        type=int,
+        default=None,
+        help="Optional lower generation budget for live turns. If a live turn "
+        "looks truncated, it is retried once with --max_new_tokens.",
     )
     parser.add_argument(
         "--max_prompt_length",
@@ -834,6 +1545,10 @@ def main():
         parser.error("--max_tool_turns must be positive")
     if args.batch_size < 1:
         parser.error("--batch_size must be positive")
+    if args.max_new_tokens < 1:
+        parser.error("--max_new_tokens must be positive")
+    if args.live_max_new_tokens is not None and args.live_max_new_tokens < 1:
+        parser.error("--live_max_new_tokens must be positive")
 
     input_coord_order = resolve_input_coord_order(args)
     refresh_prefilled = args.refresh_prefilled_tools or args.earth
@@ -885,8 +1600,36 @@ def main():
     print(f"Tool mode: {tool_mode}")
     print(f"Earth backend: {str(args.earth).lower()}")
     print(f"Input coordinate order: {input_coord_order}")
-    if args.live_tools and args.batch_size != 1:
-        print("Live tool mode evaluates one example at a time; --batch_size is ignored.")
+    live_max_new_tokens = (
+        args.live_max_new_tokens
+        if args.live_max_new_tokens is not None
+        else args.max_new_tokens
+    )
+    prefix_marker: str | None = None
+    suffix_marker: str | None = None
+    stop_strings: list[str] | None = None
+    if args.live_tools:
+        marker_tools = get_eval_tools(records[0]) if records else [GEOCODE_SCHEMA, CYCLIC_ORDER_SCHEMA]
+        discovered_markers = discover_tool_markers(tokenizer, marker_tools)
+        if discovered_markers is not None:
+            prefix_marker, suffix_marker = discovered_markers
+            if suffix_marker:
+                stop_strings = [suffix_marker]
+            print("Live tool-call markers discovered from chat template.")
+        else:
+            prefix_marker, suffix_marker = "<tool_call>", "</tool_call>"
+            stop_strings = [suffix_marker]
+            print(
+                "WARNING: chat template did not yield discoverable tool-call "
+                "markers; falling back to Qwen-style </tool_call> stop string."
+            )
+        print(f"Live batch size: {args.batch_size}")
+        print(f"Live max new tokens: {live_max_new_tokens}")
+        print(f"Truncation retry cap: {args.max_new_tokens}")
+        print(
+            "Tool-call stop string: "
+            f"{repr(stop_strings[0]) if stop_strings else 'unavailable'}"
+        )
 
     score = new_score_state()
     predictions_f = open(args.save_predictions, "w") if args.save_predictions else None
@@ -894,6 +1637,7 @@ def main():
     live_counts: dict[str, int] | None = None
     live_turns_sum = 0
     live_cyclic_sum = 0
+    live_timings: dict[str, Any] | None = None
     if args.live_tools:
         live_counts = {
             **new_live_metrics(),
@@ -901,24 +1645,34 @@ def main():
             "tool_failure_examples": 0,
         }
 
+    eval_start = time.perf_counter()
     try:
         if args.live_tools:
-            pbar = tqdm(records, desc="Evaluating", unit="example")
-            for record in pbar:
-                live_result = evaluate_record_live(
-                    record,
-                    model,
-                    tokenizer,
-                    tools=get_eval_tools(record),
-                    earth=args.earth,
-                    input_coord_order=input_coord_order,
-                    max_tool_turns=args.max_tool_turns,
-                    max_prompt_length=args.max_prompt_length,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    tool_error_policy=args.tool_error_policy,
-                )
+            live_results, frontier_stats = evaluate_records_live_batched(
+                records,
+                model,
+                tokenizer,
+                batch_size=args.batch_size,
+                earth=args.earth,
+                input_coord_order=input_coord_order,
+                max_tool_turns=args.max_tool_turns,
+                max_prompt_length=args.max_prompt_length,
+                max_new_tokens=live_max_new_tokens,
+                retry_max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                tool_error_policy=args.tool_error_policy,
+                stop_strings=stop_strings,
+                prefix_marker=prefix_marker,
+                suffix_marker=suffix_marker,
+            )
+            live_elapsed = time.perf_counter() - eval_start
+            live_timings = aggregate_live_timings(
+                live_results,
+                live_total_seconds=live_elapsed,
+                frontier_stats=frontier_stats,
+            )
 
+            for record, live_result in zip(records, live_results):
                 predicted = live_result["predicted"]
                 ground_truth = compute_ground_truth(
                     record["meta"],
@@ -930,7 +1684,7 @@ def main():
 
                 assert live_counts is not None
                 for key, value in live_result["metrics"].items():
-                    live_counts[key] += value
+                    live_counts[key] = live_counts.get(key, 0) + value
                 if live_result["status"] == "max_tool_turns":
                     live_counts["max_tool_turn_failures"] += 1
                 if live_result["status"] == "tool_failure":
@@ -952,13 +1706,6 @@ def main():
                         )
                         + "\n"
                     )
-
-                total = score["total"]
-                pbar.set_postfix(
-                    acc=f"{score['correct'] / total:.1%}" if total else "n/a",
-                    correct=f"{score['correct']}/{total}",
-                    parse_fail=score["parse_failures"],
-                )
         else:
             pbar = tqdm(
                 range(0, len(records), args.batch_size),
@@ -992,7 +1739,7 @@ def main():
                     padding=True,
                     truncation=True,
                     max_length=args.max_prompt_length,
-                ).to(model.device)
+                ).to(get_model_input_device(model))
 
                 with torch.no_grad():
                     gen_kwargs = {
@@ -1003,10 +1750,12 @@ def main():
                     if args.temperature > 0:
                         gen_kwargs["temperature"] = args.temperature
 
+                    cuda_synchronize_if_available()
                     outputs = model.generate(**inputs, **gen_kwargs)
+                    cuda_synchronize_if_available()
 
                 for j, (output, record) in enumerate(zip(outputs, batch)):
-                    prompt_len = inputs["input_ids"][j].shape[0]
+                    prompt_len = inputs["input_ids"].shape[1]
                     completion = tokenizer.decode(
                         output[prompt_len:], skip_special_tokens=True
                     )
@@ -1044,13 +1793,22 @@ def main():
         if predictions_f is not None:
             predictions_f.close()
 
+    eval_total_seconds = time.perf_counter() - eval_start
+    timing = {
+        "total_seconds": eval_total_seconds,
+        "avg_seconds_per_sample": safe_div(eval_total_seconds, len(records)),
+        "samples_per_second": safe_div(len(records), eval_total_seconds),
+    }
+
     print_results(
         score,
         pipeline=args.pipeline,
         tool_mode=tool_mode,
         earth=args.earth,
         input_coord_order=input_coord_order,
+        timing=timing,
         live_counts=live_counts,
+        live_timings=live_timings,
         live_turns_sum=live_turns_sum,
         live_cyclic_sum=live_cyclic_sum,
     )
