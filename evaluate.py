@@ -129,6 +129,25 @@ def get_eval_tools(record: dict) -> list[dict]:
     return record.get("tools") or [GEOCODE_SCHEMA, CYCLIC_ORDER_SCHEMA]
 
 
+def tool_names(tools: list[dict]) -> set[str]:
+    names: set[str] = set()
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            names.add(function["name"])
+    return names
+
+
+def record_has_tool(record: dict, tool_name: str) -> bool:
+    return tool_name in tool_names(get_eval_tools(record))
+
+
+def expected_cyclic_order_calls(record: dict) -> int:
+    if not record_has_tool(record, "cyclic_order"):
+        return 0
+    return max(len(record["meta"]["geometries"]) - 2, 0)
+
+
 def resolve_input_coord_order(args: argparse.Namespace) -> str:
     if args.input_coord_order is not None:
         return args.input_coord_order
@@ -227,6 +246,13 @@ def execute_tool_call(
         metrics["unknown_tool_calls"] += 1
         return return_or_raise_tool_error(
             f"Unknown tool: {name}",
+            metrics,
+            tool_error_policy,
+        )
+    if name not in tool_names(get_eval_tools(record)):
+        metrics["unknown_tool_calls"] += 1
+        return return_or_raise_tool_error(
+            f"Tool is not available for this record: {name}",
             metrics,
             tool_error_policy,
         )
@@ -1219,10 +1245,13 @@ def print_results(
             "    live/avg_valid_cyclic_order_calls_per_example: "
             f"{avg_valid_cyclic:.2f}"
         )
-        print(
-            "    live/valid_cyclic_order_call_ratio: "
-            f"{safe_div(valid_cyclic, expected_cyclic):.1%}"
-        )
+        if expected_cyclic:
+            print(
+                "    live/valid_cyclic_order_call_ratio: "
+                f"{safe_div(valid_cyclic, expected_cyclic):.1%}"
+            )
+        else:
+            print("    live/valid_cyclic_order_call_ratio: N/A")
         print(
             "    live/call_count_exact_match_rate: "
             f"{safe_div(live_counts.get('call_count_exact_match_examples', 0), total):.1%}"
@@ -1356,8 +1385,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if (args.live_tools or args.earth) and args.pipeline != 2:
-        parser.error("--live_tools and --earth require --pipeline 2")
+    if args.earth and args.pipeline != 2:
+        parser.error("--earth requires --pipeline 2")
     if args.refresh_prefilled_tools and args.pipeline != 2:
         parser.error("--refresh_prefilled_tools requires --pipeline 2")
     if args.limit is not None and args.limit < 0:
@@ -1508,22 +1537,29 @@ def main():
                 update_score(score, predicted=predicted, ground_truth=ground_truth, n_pts=n_pts)
 
                 assert live_counts is not None
-                expected_cyclic_calls = max(n_pts - 2, 0)
+                expected_cyclic_calls = expected_cyclic_order_calls(record)
                 valid_geocode_calls = int(
                     live_result["metrics"].get("valid_geocode_calls", 0)
                 )
                 valid_cyclic_calls = int(
                     live_result["metrics"].get("valid_cyclic_order_calls", 0)
                 )
+                invalid_or_unknown_calls = int(
+                    live_result["metrics"].get("invalid_tool_calls", 0)
+                ) + int(live_result["metrics"].get("unknown_tool_calls", 0))
+                tool_counts_match = (
+                    valid_geocode_calls == 1
+                    and valid_cyclic_calls == expected_cyclic_calls
+                    and invalid_or_unknown_calls == 0
+                )
                 live_counts["expected_cyclic_order_calls"] += expected_cyclic_calls
-                if valid_cyclic_calls == expected_cyclic_calls:
+                if tool_counts_match:
                     live_counts["call_count_exact_match_examples"] += 1
                 if valid_geocode_calls == 1:
                     live_counts["geocode_once_examples"] += 1
                 if (
                     live_result["status"] in {"ok", "parse_fail"}
-                    and valid_geocode_calls == 1
-                    and valid_cyclic_calls == expected_cyclic_calls
+                    and tool_counts_match
                 ):
                     live_counts["final_after_all_tools_examples"] += 1
 
