@@ -1,0 +1,28 @@
+/fs/nexus-scratch/adas1236/geo_finetune/.venv/lib/python3.12/site-packages/transformers/quantizers/auto.py:262: UserWarning: You passed `quantization_config` or equivalent parameters to `from_pretrained` but the model you're loading already has a `quantization_config` attribute. The `quantization_config` from the model will be used.
+  warnings.warn(warning_msg)
+Loading weights:   0%|          | 0/339 [00:00<?, ?it/s]Loading weights:  12%|█▏        | 40/339 [00:00<00:00, 360.46it/s]Loading weights:  23%|██▎       | 77/339 [00:00<00:01, 208.59it/s]Loading weights: 100%|██████████| 339/339 [00:00<00:00, 906.60it/s]
+Preflighting 100 live-turn prompts, generations=4, turn_mix=cyclic_order=0.5,geocode=0.2,final=0.3
+Sampled turn types: {'final': 30, 'geocode': 20, 'cyclic_order': 50}
+Generating:   0%|          | 0/50 [00:00<?, ?it/s]Generating:   2%|▏         | 1/50 [00:10<08:50, 10.82s/it]Generating:   4%|▍         | 2/50 [00:19<07:27,  9.32s/it]Generating:   6%|▌         | 3/50 [00:42<12:22, 15.80s/it]Generating:   8%|▊         | 4/50 [01:03<13:44, 17.92s/it]Generating:  10%|█         | 5/50 [01:25<14:20, 19.11s/it]Generating:  12%|█▏        | 6/50 [01:33<11:19, 15.44s/it]Generating:  14%|█▍        | 7/50 [01:41<09:20, 13.05s/it]Generating:  16%|█▌        | 8/50 [01:50<08:16, 11.82s/it]Generating:  18%|█▊        | 9/50 [02:11<09:54, 14.51s/it]Generating:  20%|██        | 10/50 [02:34<11:33, 17.34s/it]Generating:  22%|██▏       | 11/50 [02:50<10:54, 16.79s/it]Generating:  24%|██▍       | 12/50 [03:13<11:57, 18.88s/it]Generating:  26%|██▌       | 13/50 [03:36<12:15, 19.88s/it]Generating:  28%|██▊       | 14/50 [03:57<12:07, 20.22s/it]Generating:  30%|███       | 15/50 [04:09<10:24, 17.85s/it]Generating:  32%|███▏      | 16/50 [04:16<08:18, 14.65s/it]Generating:  34%|███▍      | 17/50 [04:39<09:21, 17.03s/it]Generating:  36%|███▌      | 18/50 [05:02<10:09, 19.03s/it]Generating:  38%|███▊      | 19/50 [05:25<10:20, 20.03s/it]Generating:  40%|████      | 20/50 [05:34<08:19, 16.66s/it]Generating:  42%|████▏     | 21/50 [05:42<06:50, 14.16s/it]Generating:  44%|████▍     | 22/50 [06:04<07:44, 16.61s/it]Generating:  46%|████▌     | 23/50 [06:26<08:11, 18.20s/it]Generating:  48%|████▊     | 24/50 [06:46<08:09, 18.83s/it]Generating:  50%|█████     | 25/50 [07:07<08:01, 19.26s/it]Generating:  52%|█████▏    | 26/50 [07:26<07:40, 19.20s/it]Generating:  54%|█████▍    | 27/50 [07:48<07:41, 20.07s/it]Generating:  56%|█████▌    | 28/50 [08:09<07:29, 20.44s/it]Generating:  58%|█████▊    | 29/50 [08:33<07:29, 21.41s/it]Generating:  60%|██████    | 30/50 [08:55<07:10, 21.52s/it]Generating:  62%|██████▏   | 31/50 [09:13<06:31, 20.58s/it]Generating:  64%|██████▍   | 32/50 [09:35<06:18, 21.05s/it]Generating:  66%|██████▌   | 33/50 [09:57<06:02, 21.32s/it]Generating:  68%|██████▊   | 34/50 [10:18<05:37, 21.10s/it]Generating:  70%|███████   | 35/50 [10:38<05:10, 20.71s/it]Generating:  72%|███████▏  | 36/50 [10:44<03:49, 16.38s/it]Generating:  74%|███████▍  | 37/50 [10:54<03:08, 14.51s/it]Generating:  76%|███████▌  | 38/50 [11:15<03:15, 16.33s/it]Generating:  78%|███████▊  | 39/50 [11:36<03:15, 17.75s/it]Generating:  80%|████████  | 40/50 [11:59<03:13, 19.38s/it]Generating:  82%|████████▏ | 41/50 [12:22<03:05, 20.67s/it]Generating:  84%|████████▍ | 42/50 [12:33<02:21, 17.71s/it]Generating:  86%|████████▌ | 43/50 [12:57<02:16, 19.50s/it]Generating:  88%|████████▊ | 44/50 [13:19<02:00, 20.16s/it]Generating:  90%|█████████ | 45/50 [13:40<01:42, 20.59s/it]Generating:  92%|█████████▏| 46/50 [14:04<01:26, 21.52s/it]Generating:  94%|█████████▍| 47/50 [14:27<01:06, 22.05s/it]Generating:  96%|█████████▌| 48/50 [14:51<00:45, 22.53s/it]Generating:  98%|█████████▊| 49/50 [15:15<00:22, 22.89s/it]Generating: 100%|██████████| 50/50 [15:37<00:00, 22.85s/it]Generating: 100%|██████████| 50/50 [15:37<00:00, 18.76s/it]
+
+Live reward-signal preflight
+========================================================================
+Prompts:                       100
+Completions:                   400
+Mean reward:                   1.435
+Nonzero advantage rate:        41.0%
+Parseable tool-call rate:      58.8%
+Tool-name accuracy:            58.8%
+Argument-schema accuracy:      58.8%
+Argument-value accuracy:       42.2%
+Single-call rate:              58.8%
+Premature final-answer rate:   21.8%
+Final-answer parse rate:       30.0%
+Final-answer accuracy:         28.5%
+Final no-tool-call rate:       30.0%
+
+Per turn type
+  geocode      prompts=  20 mean_reward=1.403 nonzero_adv=15.0% arg_value=42.5% final_acc=0.0%
+  cyclic_order prompts=  50 mean_reward=1.438 nonzero_adv=72.0% arg_value=67.5% final_acc=0.0%
+  final        prompts=  30 mean_reward=1.450 nonzero_adv=6.7% arg_value=0.0% final_acc=95.0%
+========================================================================

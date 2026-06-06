@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -24,6 +23,14 @@ from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 from reward import compute_ground_truth, extract_answer
+from tool_call_parsing import (
+    ToolCallParseError,
+    _match_braces,
+    decode_tool_arguments,
+    discover_tool_markers,
+    extract_tool_calls_from_completion,
+    parse_lonlat_pair,
+)
 from tools import (
     CYCLIC_ORDER_SCHEMA,
     GEOCODE_SCHEMA,
@@ -31,13 +38,6 @@ from tools import (
     compute_cyclic_order_earth,
     representative_point_lonlat,
 )
-
-
-@dataclass
-class ParsedAssistantTurn:
-    content: str
-    tool_calls: list[dict]
-    parse_error: str | None = None
 
 
 @dataclass
@@ -145,21 +145,6 @@ def make_tool_call(name: str, arguments: dict[str, Any]) -> dict:
     }
 
 
-def parse_lonlat_pair(value: Any, arg_name: str) -> tuple[float, float]:
-    if not isinstance(value, (list, tuple)) or len(value) != 2:
-        raise ToolExecutionError(f"{arg_name} must be a two-number [longitude, latitude] pair")
-
-    lon, lat = value
-    if (
-        isinstance(lon, bool)
-        or isinstance(lat, bool)
-        or not isinstance(lon, (int, float))
-        or not isinstance(lat, (int, float))
-    ):
-        raise ToolExecutionError(f"{arg_name} must contain numeric longitude/latitude values")
-    return (float(lon), float(lat))
-
-
 def execute_geocode(
     arguments: dict,
     record: dict,
@@ -208,22 +193,6 @@ def execute_cyclic_order(
     return {"result": cyclic_order_fn(center, point_b, point_c)}
 
 
-def decode_tool_arguments(raw_arguments: Any) -> dict:
-    if isinstance(raw_arguments, str):
-        try:
-            arguments = json.loads(raw_arguments) if raw_arguments.strip() else {}
-        except json.JSONDecodeError as exc:
-            raise ToolExecutionError(f"Invalid JSON tool arguments: {exc.msg}") from exc
-    elif isinstance(raw_arguments, dict):
-        arguments = raw_arguments
-    else:
-        raise ToolExecutionError("Tool arguments must be a JSON object or JSON object string")
-
-    if not isinstance(arguments, dict):
-        raise ToolExecutionError("Tool arguments must decode to a JSON object")
-    return arguments
-
-
 def return_or_raise_tool_error(
     message: str,
     metrics: dict[str, int],
@@ -266,265 +235,20 @@ def execute_tool_call(
         arguments = decode_tool_arguments(function.get("arguments", {}))
         if name == "geocode":
             metrics["geocode_calls"] += 1
-            return execute_geocode(
+            result = execute_geocode(
                 arguments,
                 record,
                 input_coord_order=input_coord_order,
             )
+            metrics["valid_geocode_calls"] += 1
+            return result
         metrics["cyclic_order_calls"] += 1
-        return execute_cyclic_order(arguments, earth=earth)
-    except ToolExecutionError as exc:
+        result = execute_cyclic_order(arguments, earth=earth)
+        metrics["valid_cyclic_order_calls"] += 1
+        return result
+    except (ToolExecutionError, ToolCallParseError) as exc:
         metrics["invalid_tool_calls"] += 1
         return return_or_raise_tool_error(str(exc), metrics, tool_error_policy)
-
-
-def strip_markdown_fence(text: str) -> str:
-    stripped = text.strip()
-    if not stripped.startswith("```"):
-        return stripped
-
-    stripped = re.sub(r"^```(?:json)?\s*", "", stripped, flags=re.IGNORECASE)
-    stripped = re.sub(r"\s*```$", "", stripped)
-    return stripped.strip()
-
-
-def clean_parsed_content(text: str) -> str:
-    text = re.sub(r"<\|[^>]*?\|>", "", text)
-    text = text.replace("</s>", "").replace("<s>", "")
-    return text.strip()
-
-
-def _match_braces(text: str, start: int) -> int:
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if esc:
-            esc = False
-            continue
-        if c == "\\" and in_str:
-            esc = True
-            continue
-        if c == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return i + 1
-    return -1
-
-
-def discover_tool_markers(tokenizer: AutoTokenizer, tools: list[dict]) -> tuple[str, str] | None:
-    """Infer the tokenizer's tool-call wrapper from its chat template."""
-    sentinel_tool = "ZZPROBETOOL"
-    sentinel_text = "ZZPROBETXT"
-
-    probe_tool = [
-        {"role": "user", "content": "u"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "probe0",
-                    "type": "function",
-                    "function": {
-                        "name": sentinel_tool,
-                        "arguments": json.dumps({"k": 1}),
-                    },
-                }
-            ],
-        },
-    ]
-    probe_text = [
-        {"role": "user", "content": "u"},
-        {"role": "assistant", "content": sentinel_text},
-    ]
-
-    def render(msgs: list[dict]) -> str | None:
-        try:
-            return tokenizer.apply_chat_template(
-                msgs,
-                tools=tools,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-        except Exception:
-            try:
-                return tokenizer.apply_chat_template(
-                    msgs,
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
-            except Exception:
-                return None
-
-    rendered_tool = render(probe_tool)
-    rendered_text = render(probe_text)
-    if rendered_tool is None or rendered_text is None:
-        return None
-    if sentinel_tool not in rendered_tool or sentinel_text not in rendered_text:
-        return None
-
-    pre_len = 0
-    n = min(len(rendered_tool), len(rendered_text))
-    while pre_len < n and rendered_tool[pre_len] == rendered_text[pre_len]:
-        pre_len += 1
-
-    suf_len = 0
-    while (
-        suf_len < len(rendered_tool) - pre_len
-        and suf_len < len(rendered_text) - pre_len
-        and rendered_tool[-1 - suf_len] == rendered_text[-1 - suf_len]
-    ):
-        suf_len += 1
-
-    diverged = rendered_tool[pre_len : len(rendered_tool) - suf_len]
-    sent_pos = diverged.find(sentinel_tool)
-    if sent_pos == -1:
-        return None
-    json_start = diverged.rfind("{", 0, sent_pos)
-    if json_start == -1:
-        return None
-    json_end = _match_braces(diverged, json_start)
-    if json_end == -1:
-        return None
-
-    prefix = diverged[:json_start]
-    suffix = diverged[json_end:]
-    if not prefix and not suffix:
-        return None
-    return prefix, suffix
-
-
-def normalize_tool_call(obj: Any) -> dict | None:
-    if not isinstance(obj, dict):
-        return None
-
-    function = obj.get("function")
-    if isinstance(function, dict):
-        name = function.get("name")
-        arguments = function.get("arguments", {})
-    elif isinstance(obj.get("function_call"), dict):
-        function_call = obj["function_call"]
-        name = function_call.get("name")
-        arguments = function_call.get("arguments", {})
-    else:
-        name = obj.get("name")
-        arguments = obj.get("arguments", {})
-
-    if not isinstance(name, str):
-        return None
-
-    if isinstance(arguments, str):
-        argument_text = arguments
-    else:
-        argument_text = json.dumps(arguments, ensure_ascii=False)
-
-    return {
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": argument_text,
-        },
-    }
-
-
-def tool_calls_from_json_obj(obj: Any) -> list[dict]:
-    if isinstance(obj, list):
-        calls = []
-        for item in obj:
-            calls.extend(tool_calls_from_json_obj(item))
-        return calls
-
-    if not isinstance(obj, dict):
-        return []
-
-    if isinstance(obj.get("tool_calls"), list):
-        calls = []
-        for item in obj["tool_calls"]:
-            calls.extend(tool_calls_from_json_obj(item))
-        return calls
-
-    normalized = normalize_tool_call(obj)
-    return [normalized] if normalized is not None else []
-
-
-def parse_json_tool_calls(text: str) -> list[dict]:
-    stripped = strip_markdown_fence(text)
-    try:
-        calls = tool_calls_from_json_obj(json.loads(stripped))
-        if calls:
-            return calls
-    except json.JSONDecodeError:
-        pass
-
-    decoder = json.JSONDecoder()
-    calls: list[dict] = []
-    idx = 0
-    while idx < len(stripped):
-        starts = [pos for pos in (stripped.find("{", idx), stripped.find("[", idx)) if pos >= 0]
-        if not starts:
-            break
-        pos = min(starts)
-        try:
-            obj, end = decoder.raw_decode(stripped[pos:])
-        except json.JSONDecodeError:
-            idx = pos + 1
-            continue
-
-        parsed_calls = tool_calls_from_json_obj(obj)
-        if parsed_calls:
-            calls.extend(parsed_calls)
-        idx = pos + max(end, 1)
-
-    return calls
-
-
-def extract_tool_calls_from_completion(text: str) -> ParsedAssistantTurn:
-    tag_pattern = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
-    tag_matches = list(tag_pattern.finditer(text))
-    if tag_matches:
-        calls: list[dict] = []
-        parse_errors = 0
-        for match in tag_matches:
-            parsed = parse_json_tool_calls(match.group(1))
-            if parsed:
-                calls.extend(parsed)
-            else:
-                parse_errors += 1
-
-        content = clean_parsed_content(tag_pattern.sub("", text))
-        if calls:
-            error = f"{parse_errors} malformed tool call block(s)" if parse_errors else None
-            return ParsedAssistantTurn(content=content, tool_calls=calls, parse_error=error)
-        return ParsedAssistantTurn(
-            content=content,
-            tool_calls=[],
-            parse_error="Malformed <tool_call> block",
-        )
-
-    calls = parse_json_tool_calls(text)
-    if calls:
-        return ParsedAssistantTurn(content="", tool_calls=calls)
-
-    lower = text.lower()
-    looks_like_tool_call = (
-        "tool_call" in lower
-        or "tool_calls" in lower
-        or ("arguments" in lower and "name" in lower and "function" in lower)
-    )
-    return ParsedAssistantTurn(
-        content=clean_parsed_content(text),
-        tool_calls=[],
-        parse_error="Could not parse tool-call-like text" if looks_like_tool_call else None,
-    )
 
 
 def materialize_prefilled_messages_from_meta(
@@ -735,6 +459,8 @@ def new_live_metrics() -> dict[str, int]:
         "unknown_tool_calls": 0,
         "geocode_calls": 0,
         "cyclic_order_calls": 0,
+        "valid_geocode_calls": 0,
+        "valid_cyclic_order_calls": 0,
         "tool_error_returns": 0,
         "truncation_retries": 0,
         "truncation_retry_successes": 0,
@@ -1188,20 +914,58 @@ def evaluate_record_live(
     }
 
 
+ANSWER_LABELS = ("clockwise", "counterclockwise", "neither")
+CONFUSION_LABELS = ("clockwise", "counterclockwise", "neither", "parse_fail")
+
+
+def new_confusion_matrix() -> dict[str, dict[str, int]]:
+    return {
+        gt: {pred: 0 for pred in CONFUSION_LABELS}
+        for gt in ANSWER_LABELS
+    }
+
+
+def update_confusion_matrix(
+    matrix: dict[str, dict[str, int]],
+    *,
+    ground_truth: str,
+    predicted: str | None,
+) -> None:
+    if ground_truth not in matrix:
+        return
+
+    prediction_bucket = "parse_fail" if predicted is None else predicted
+    if prediction_bucket in matrix[ground_truth]:
+        matrix[ground_truth][prediction_bucket] += 1
+
+
+def print_confusion_matrix(
+    matrix: dict[str, dict[str, int]],
+    labels: list[str],
+    *,
+    indent: str,
+) -> None:
+    print(indent + "".join(f"{label:>18s}" for label in labels))
+    for gt in ANSWER_LABELS:
+        counts = "".join(
+            f"{matrix[gt][pred]:18d}"
+            for pred in labels
+        )
+        print(f"{indent}{gt:18s}{counts}")
+
+
 def new_score_state() -> dict[str, Any]:
     return {
         "correct": 0,
         "total": 0,
         "parse_failures": 0,
-        "per_class_total": {"clockwise": 0, "counterclockwise": 0, "neither": 0},
-        "per_class_correct": {"clockwise": 0, "counterclockwise": 0, "neither": 0},
-        "confusion_labels": ["clockwise", "counterclockwise", "neither", "parse_fail"],
-        "confusion": {
-            gt: {pred: 0 for pred in ["clockwise", "counterclockwise", "neither", "parse_fail"]}
-            for gt in ("clockwise", "counterclockwise", "neither")
-        },
+        "per_class_total": {label: 0 for label in ANSWER_LABELS},
+        "per_class_correct": {label: 0 for label in ANSWER_LABELS},
+        "confusion_labels": list(CONFUSION_LABELS),
+        "confusion": new_confusion_matrix(),
         "per_n_total": {},
         "per_n_correct": {},
+        "per_n_confusion": {},
     }
 
 
@@ -1215,20 +979,28 @@ def update_score(
     if ground_truth in score["per_class_total"]:
         score["per_class_total"][ground_truth] += 1
     score["per_n_total"][n_pts] = score["per_n_total"].get(n_pts, 0) + 1
+    per_n_confusion = score["per_n_confusion"].setdefault(
+        n_pts,
+        new_confusion_matrix(),
+    )
+    update_confusion_matrix(
+        score["confusion"],
+        ground_truth=ground_truth,
+        predicted=predicted,
+    )
+    update_confusion_matrix(
+        per_n_confusion,
+        ground_truth=ground_truth,
+        predicted=predicted,
+    )
 
     if predicted is None:
         score["parse_failures"] += 1
-        if ground_truth in score["confusion"]:
-            score["confusion"][ground_truth]["parse_fail"] += 1
     elif predicted == ground_truth:
         score["correct"] += 1
         if ground_truth in score["per_class_correct"]:
             score["per_class_correct"][ground_truth] += 1
-        if ground_truth in score["confusion"]:
-            score["confusion"][ground_truth][predicted] += 1
         score["per_n_correct"][n_pts] = score["per_n_correct"].get(n_pts, 0) + 1
-    elif ground_truth in score["confusion"] and predicted in score["confusion"][ground_truth]:
-        score["confusion"][ground_truth][predicted] += 1
 
     score["total"] += 1
 
@@ -1370,7 +1142,7 @@ def print_results(
     print(f"  Accuracy:       {correct / total:.1%}" if total > 0 else "  Accuracy: N/A")
     print(f"  Parse failures: {score['parse_failures']}")
     print("  Per-class accuracy:")
-    for cls in ("clockwise", "counterclockwise", "neither"):
+    for cls in ANSWER_LABELS:
         n_cls = score["per_class_total"][cls]
         c_cls = score["per_class_correct"][cls]
         if n_cls > 0:
@@ -1378,18 +1150,24 @@ def print_results(
         else:
             print(f"    {cls:18s} 0/0 (no examples)")
     print("  Confusion matrix (rows=ground truth, columns=prediction):")
-    print("    " + "".join(f"{label:>18s}" for label in score["confusion_labels"]))
-    for gt in ("clockwise", "counterclockwise", "neither"):
-        counts = "".join(
-            f"{score['confusion'][gt][pred]:18d}"
-            for pred in score["confusion_labels"]
-        )
-        print(f"    {gt:18s}{counts}")
+    print_confusion_matrix(
+        score["confusion"],
+        score["confusion_labels"],
+        indent="    ",
+    )
     print("  Per-n accuracy (n = number of points = len(geometries)):")
     for n_pts in sorted(score["per_n_total"].keys()):
         n_cnt = score["per_n_total"][n_pts]
         c_cnt = score["per_n_correct"].get(n_pts, 0)
         print(f"    n={n_pts:<3d}            {c_cnt}/{n_cnt} = {c_cnt / n_cnt:.1%}")
+    print("  Per-n confusion matrices (rows=ground truth, columns=prediction):")
+    for n_pts in sorted(score["per_n_total"].keys()):
+        print(f"    n={n_pts}:")
+        print_confusion_matrix(
+            score["per_n_confusion"][n_pts],
+            score["confusion_labels"],
+            indent="      ",
+        )
 
     if timing is not None:
         print("  Timing:")
@@ -1411,6 +1189,9 @@ def print_results(
             "unknown_tool_calls",
             "geocode_calls",
             "cyclic_order_calls",
+            "valid_geocode_calls",
+            "valid_cyclic_order_calls",
+            "expected_cyclic_order_calls",
             "tool_error_returns",
             "truncation_retries",
             "truncation_retry_successes",
@@ -1420,8 +1201,48 @@ def print_results(
             print(f"    live/{key}: {live_counts.get(key, 0)}")
         avg_turns = live_turns_sum / total if total else 0.0
         avg_cyclic = live_cyclic_sum / total if total else 0.0
+        avg_valid_cyclic = (
+            live_counts.get("valid_cyclic_order_calls", 0) / total
+            if total
+            else 0.0
+        )
+        expected_cyclic = live_counts.get("expected_cyclic_order_calls", 0)
+        valid_cyclic = live_counts.get("valid_cyclic_order_calls", 0)
+        attempted_tool_calls = (
+            live_counts.get("geocode_calls", 0)
+            + live_counts.get("cyclic_order_calls", 0)
+            + live_counts.get("unknown_tool_calls", 0)
+        )
         print(f"    live/avg_turns: {avg_turns:.2f}")
         print(f"    live/avg_cyclic_order_calls_per_example: {avg_cyclic:.2f}")
+        print(
+            "    live/avg_valid_cyclic_order_calls_per_example: "
+            f"{avg_valid_cyclic:.2f}"
+        )
+        print(
+            "    live/valid_cyclic_order_call_ratio: "
+            f"{safe_div(valid_cyclic, expected_cyclic):.1%}"
+        )
+        print(
+            "    live/call_count_exact_match_rate: "
+            f"{safe_div(live_counts.get('call_count_exact_match_examples', 0), total):.1%}"
+        )
+        print(
+            "    live/geocode_once_rate: "
+            f"{safe_div(live_counts.get('geocode_once_examples', 0), total):.1%}"
+        )
+        print(
+            "    live/final_after_all_tools_rate: "
+            f"{safe_div(live_counts.get('final_after_all_tools_examples', 0), total):.1%}"
+        )
+        print(
+            "    live/invalid_tool_call_rate: "
+            f"{safe_div(live_counts.get('invalid_tool_calls', 0), attempted_tool_calls):.1%}"
+        )
+        print(
+            "    live/tool_parse_failure_rate: "
+            f"{safe_div(live_counts.get('tool_parse_failures', 0), live_turns_sum):.1%}"
+        )
     if live_timings is not None:
         print("  Live timing:")
         for key in (
@@ -1643,6 +1464,10 @@ def main():
             **new_live_metrics(),
             "max_tool_turn_failures": 0,
             "tool_failure_examples": 0,
+            "expected_cyclic_order_calls": 0,
+            "call_count_exact_match_examples": 0,
+            "geocode_once_examples": 0,
+            "final_after_all_tools_examples": 0,
         }
 
     eval_start = time.perf_counter()
@@ -1683,6 +1508,25 @@ def main():
                 update_score(score, predicted=predicted, ground_truth=ground_truth, n_pts=n_pts)
 
                 assert live_counts is not None
+                expected_cyclic_calls = max(n_pts - 2, 0)
+                valid_geocode_calls = int(
+                    live_result["metrics"].get("valid_geocode_calls", 0)
+                )
+                valid_cyclic_calls = int(
+                    live_result["metrics"].get("valid_cyclic_order_calls", 0)
+                )
+                live_counts["expected_cyclic_order_calls"] += expected_cyclic_calls
+                if valid_cyclic_calls == expected_cyclic_calls:
+                    live_counts["call_count_exact_match_examples"] += 1
+                if valid_geocode_calls == 1:
+                    live_counts["geocode_once_examples"] += 1
+                if (
+                    live_result["status"] in {"ok", "parse_fail"}
+                    and valid_geocode_calls == 1
+                    and valid_cyclic_calls == expected_cyclic_calls
+                ):
+                    live_counts["final_after_all_tools_examples"] += 1
+
                 for key, value in live_result["metrics"].items():
                     live_counts[key] = live_counts.get(key, 0) + value
                 if live_result["status"] == "max_tool_turns":
