@@ -12,7 +12,11 @@ Google Geocoding, etc.) and `cyclic_order` performs the deterministic computatio
 
 from __future__ import annotations
 
+import json
 import math
+import time
+import urllib.parse
+import urllib.request
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -236,4 +240,260 @@ def build_geocode_result(
     for name, geom in zip(location_names, geometries):
         x, y = representative_point(geom)
         result[name] = {"longitude": round(x, 6), "latitude": round(y, 6)}
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Live geocoding (Nominatim / OpenStreetMap)
+# ---------------------------------------------------------------------------
+#
+# A real implementation of `geocode` for inference/interactive use. Nominatim can
+# return several candidates for one name (Paris, France vs Paris, Texas), but the
+# tool must return exactly one coordinate per name. We disambiguate by geographic
+# context: because a cyclic-order question's places cluster in one region, we pick
+# the candidate per name that keeps the whole set mutually close.
+
+NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+DEFAULT_GEOCODE_USER_AGENT = "geo-finetune-testbench/0.1"
+
+# Nominatim's usage policy asks for at most one request per second.
+_MIN_REQUEST_INTERVAL = 1.0
+_last_request_time = 0.0
+
+
+def _respect_rate_limit() -> None:
+    global _last_request_time
+    wait = _MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_time)
+    if wait > 0:
+        time.sleep(wait)
+    _last_request_time = time.monotonic()
+
+
+def _nominatim_search(
+    query: str,
+    *,
+    candidates: int,
+    countrycodes: str | None,
+    viewbox: str | None,
+    user_agent: str,
+    timeout: float,
+) -> list[dict[str, Any]]:
+    """Query Nominatim for one place name; return a list of candidate dicts
+    (``lon``, ``lat``, ``importance``, ``display_name``), highest importance
+    first (the order Nominatim already returns)."""
+    params = {"q": query, "format": "json", "limit": str(max(1, candidates))}
+    if countrycodes:
+        params["countrycodes"] = countrycodes
+    if viewbox:
+        params["viewbox"] = viewbox
+        params["bounded"] = "1"
+    url = NOMINATIM_URL + "?" + urllib.parse.urlencode(params)
+
+    _respect_rate_limit()
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.load(resp)
+
+    out: list[dict[str, Any]] = []
+    for item in data:
+        try:
+            lon = float(item["lon"])
+            lat = float(item["lat"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append(
+            {
+                "lon": lon,
+                "lat": lat,
+                "importance": float(item.get("importance", 0.0) or 0.0),
+                "display_name": item.get("display_name", ""),
+            }
+        )
+    return out
+
+
+def _centroid_unit(
+    vecs: list[tuple[float, float, float]],
+) -> tuple[float, float, float] | None:
+    sx = sum(v[0] for v in vecs)
+    sy = sum(v[1] for v in vecs)
+    sz = sum(v[2] for v in vecs)
+    norm = math.sqrt(sx * sx + sy * sy + sz * sz)
+    if norm < 1e-12:
+        return None
+    return (sx / norm, sy / norm, sz / norm)
+
+
+def _angular_distance(
+    u: tuple[float, float, float],
+    v: tuple[float, float, float],
+) -> float:
+    return math.acos(max(-1.0, min(1.0, _dot3(u, v))))
+
+
+def _cluster_spread(vecs: list[tuple[float, float, float]]) -> float:
+    """Sum of angular distances from each unit vector to the cluster centroid.
+    Lower = geographically tighter. ``inf`` for a degenerate (antipodal) cluster."""
+    centroid = _centroid_unit(vecs)
+    if centroid is None:
+        return float("inf")
+    return sum(_angular_distance(v, centroid) for v in vecs)
+
+
+def _greedy_assign(
+    multi: dict[str, list[dict[str, Any]]],
+    base_vecs: list[tuple[float, float, float]],
+    seed: tuple[str, dict[str, Any]] | None,
+) -> tuple[dict[str, dict[str, Any]], list[tuple[float, float, float]]]:
+    """Greedily assign one candidate per name in ``multi``, growing a cluster from
+    ``base_vecs`` (fixed anchors) plus an optional ``seed`` (name, candidate). At
+    each step pick the (name, candidate) closest to the running centroid (ties by
+    higher importance, then display name). Returns (assignment, all unit vectors).
+    """
+    assignment: dict[str, dict[str, Any]] = {}
+    vecs = list(base_vecs)
+    remaining = dict(multi)
+    if seed is not None:
+        sname, scand = seed
+        assignment[sname] = scand
+        vecs.append(lonlat_to_unit_vector((scand["lon"], scand["lat"])))
+        remaining.pop(sname, None)
+
+    while remaining:
+        centroid = _centroid_unit(vecs)
+        best_key = None
+        best_name = None
+        best_cand = None
+        for name, cands in remaining.items():
+            for cand in cands:
+                vec = lonlat_to_unit_vector((cand["lon"], cand["lat"]))
+                if centroid is None:  # nothing to be near yet: go by importance
+                    key = (0.0, -cand["importance"], cand["display_name"])
+                else:
+                    key = (
+                        _angular_distance(vec, centroid),
+                        -cand["importance"],
+                        cand["display_name"],
+                    )
+                if best_key is None or key < best_key:
+                    best_key, best_name, best_cand = key, name, cand
+        assignment[best_name] = best_cand
+        vecs.append(
+            lonlat_to_unit_vector((best_cand["lon"], best_cand["lat"]))
+        )
+        del remaining[best_name]
+
+    return assignment, vecs
+
+
+def _disambiguate_by_proximity(
+    candidates_per_name: dict[str, list[dict[str, Any]]],
+    fixed_points: dict[str, tuple[float, float]] | None = None,
+) -> dict[str, tuple[float, float] | None]:
+    """Pick exactly one candidate per name so the chosen set is geographically
+    coherent.
+
+    ``fixed_points`` and any single-candidate names anchor the cluster. For the
+    ambiguous (multi-candidate) names we run a **multi-start greedy**: try
+    starting the cluster from each candidate, then keep the assignment whose
+    final cluster is tightest (ties broken toward higher total importance). This
+    prevents one famous-but-wrong candidate (e.g. Paris, France in a Texan
+    question) from anchoring the whole set in the wrong region. Names with no
+    candidates resolve to ``None``.
+    """
+    chosen: dict[str, tuple[float, float] | None] = {}
+    base_vecs: list[tuple[float, float, float]] = []
+
+    if fixed_points:
+        for lon, lat in fixed_points.values():
+            base_vecs.append(lonlat_to_unit_vector((lon, lat)))
+
+    multi: dict[str, list[dict[str, Any]]] = {}
+    for name, cands in candidates_per_name.items():
+        if not cands:
+            chosen[name] = None
+        elif len(cands) == 1:
+            coord = (cands[0]["lon"], cands[0]["lat"])
+            chosen[name] = coord
+            base_vecs.append(lonlat_to_unit_vector(coord))
+        else:
+            multi[name] = cands
+
+    if not multi:
+        return chosen
+
+    starts: list[tuple[str, dict[str, Any]] | None] = []
+    if base_vecs:
+        starts.append(None)  # also try growing purely from the fixed anchors
+    starts.extend(
+        (name, cand) for name, cands in multi.items() for cand in cands
+    )
+
+    best_score = None
+    best_assignment: dict[str, dict[str, Any]] = {}
+    for seed in starts:
+        assignment, vecs = _greedy_assign(multi, base_vecs, seed)
+        total_importance = sum(c["importance"] for c in assignment.values())
+        score = (_cluster_spread(vecs), -total_importance)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_assignment = assignment
+
+    for name, cand in best_assignment.items():
+        chosen[name] = (cand["lon"], cand["lat"])
+    return chosen
+
+
+def geocode_nominatim(
+    place_names: list[str],
+    *,
+    candidates: int = 5,
+    countrycodes: str | None = None,
+    viewbox: str | None = None,
+    fixed_points: dict[str, tuple[float, float]] | None = None,
+    user_agent: str = DEFAULT_GEOCODE_USER_AGENT,
+    timeout: float = 10.0,
+) -> dict[str, dict[str, float | str]]:
+    """Geocode a list of names via Nominatim, returning exactly one coordinate
+    per name as ``{name: {"longitude": x, "latitude": y}}`` (or
+    ``{name: {"error": ...}}`` for names that fail or have no match).
+
+    ``fixed_points`` are already-known ``name -> (lon, lat)`` anchors (e.g. names
+    resolved from a local store) that seed the proximity cluster but are not
+    re-resolved or returned. Never raises on a single bad name — failures are
+    reported per-name so the model can react.
+    """
+    candidates_per_name: dict[str, list[dict[str, Any]]] = {}
+    errors: dict[str, dict[str, float | str]] = {}
+
+    for name in place_names:
+        query = name.strip()
+        if not query:
+            errors[name] = {"error": "empty place name"}
+            continue
+        try:
+            candidates_per_name[name] = _nominatim_search(
+                query,
+                candidates=candidates,
+                countrycodes=countrycodes,
+                viewbox=viewbox,
+                user_agent=user_agent,
+                timeout=timeout,
+            )
+        except Exception as e:  # network / HTTP / JSON errors
+            errors[name] = {"error": f"geocoding failed: {type(e).__name__}: {e}"}
+
+    chosen = _disambiguate_by_proximity(candidates_per_name, fixed_points)
+
+    result: dict[str, dict[str, float | str]] = {}
+    for name in place_names:
+        if name in errors:
+            result[name] = errors[name]
+            continue
+        coord = chosen.get(name)
+        if coord is None:
+            result[name] = {"error": f"no geocoding result for {name!r}"}
+        else:
+            lon, lat = coord
+            result[name] = {"longitude": round(lon, 6), "latitude": round(lat, 6)}
     return result

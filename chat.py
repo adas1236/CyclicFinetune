@@ -30,6 +30,7 @@ import argparse
 import json
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator
 
@@ -51,8 +52,10 @@ from tool_call_parsing import (
     parse_lonlat_pair,
 )
 from tools import (
+    DEFAULT_GEOCODE_USER_AGENT,
     compute_cyclic_order,
     compute_cyclic_order_earth,
+    geocode_nominatim,
     representative_point_lonlat,
 )
 
@@ -66,6 +69,21 @@ os.environ["GRADIO_TEMP_DIR"] = str(PROJECT_ROOT / "gradio_tmp")
 os.makedirs(os.environ['GRADIO_TEMP_DIR'], exist_ok=True)
 
 VALID_TYPES = ("point", "line", "polygon")
+
+
+@dataclass
+class GeocodeConfig:
+    """Settings for the live OpenStreetMap (Nominatim) geocode tool.
+
+    Present (non-None) only when the user passes ``--geocode``; otherwise the
+    geocode tool resolves names from the local store alone.
+    """
+
+    candidates: int = 5
+    countrycodes: str | None = None
+    viewbox: str | None = None
+    user_agent: str = DEFAULT_GEOCODE_USER_AGENT
+    cache_writeback: bool = True
 
 # The system prompt (`_system_prompt`) and tool schemas (`_tool_list`) are
 # imported from prepare_data so this test bench always matches what the models
@@ -238,6 +256,67 @@ def tool_geocode(
     return out
 
 
+def _coords_in_store_order(
+    lon: float, lat: float, input_coord_order: str
+) -> list[float]:
+    """Order a model-facing (lon, lat) pair to match how the store is read."""
+    return [lat, lon] if input_coord_order == "latlon" else [lon, lat]
+
+
+def tool_geocode_live(
+    place_names: list[str],
+    store: dict[str, dict],
+    *,
+    input_coord_order: str,
+    config: GeocodeConfig,
+) -> dict:
+    """Live geocode via Nominatim, with the local store as an override + cache.
+
+    Names already in the store (exact / case-insensitive) resolve from it
+    directly and also seed the proximity disambiguation as fixed anchors, so the
+    remaining names cluster around them. Newly resolved names are (optionally)
+    written back into the store as point geometries so repeat lookups are cached
+    and the user can correct them from the Geometries tab.
+    """
+    out: dict[str, dict] = {}
+    fixed_points: dict[str, tuple[float, float]] = {}
+    misses: list[str] = []
+
+    for name in place_names:
+        match = name if name in store else next(
+            (k for k in store if k.lower() == name.lower()), None
+        )
+        if match is None:
+            misses.append(name)
+            continue
+        lon, lat = representative_point_lonlat(
+            store[match], input_coord_order=input_coord_order
+        )
+        out[name] = {"longitude": round(lon, 6), "latitude": round(lat, 6)}
+        fixed_points[name] = (lon, lat)
+
+    if misses:
+        resolved = geocode_nominatim(
+            misses,
+            candidates=config.candidates,
+            countrycodes=config.countrycodes,
+            viewbox=config.viewbox,
+            fixed_points=fixed_points,
+            user_agent=config.user_agent,
+        )
+        for name, res in resolved.items():
+            out[name] = res
+            if config.cache_writeback and "error" not in res and name not in store:
+                try:
+                    coords = _coords_in_store_order(
+                        res["longitude"], res["latitude"], input_coord_order
+                    )
+                    add_geometry(store, name, "point", [coords])
+                except Exception:
+                    pass  # caching is best-effort; never break a geocode call
+    return out
+
+
 def tool_cyclic_order(arguments: dict, *, earth: bool) -> dict:
     center = parse_lonlat_pair(arguments["center"], "center")
     point_b = parse_lonlat_pair(arguments["point_b"], "point_b")
@@ -253,10 +332,19 @@ def dispatch_tool(
     *,
     earth: bool,
     input_coord_order: str,
+    geocode_config: GeocodeConfig | None = None,
 ) -> dict:
     if name == "geocode":
+        place_names = arguments.get("place_names", [])
+        if geocode_config is not None:
+            return tool_geocode_live(
+                place_names,
+                store,
+                input_coord_order=input_coord_order,
+                config=geocode_config,
+            )
         return tool_geocode(
-            arguments.get("place_names", []),
+            place_names,
             store,
             input_coord_order=input_coord_order,
         )
@@ -386,6 +474,7 @@ def run_conversation(
     *,
     earth: bool,
     input_coord_order: str,
+    geocode_config: GeocodeConfig | None = None,
     max_tool_turns: int = 12,
     max_new_tokens: int = 1024,
 ) -> Generator[tuple[list[dict], list[dict], list[dict]], None, None]:
@@ -467,6 +556,7 @@ def run_conversation(
                         store,
                         earth=earth,
                         input_coord_order=input_coord_order,
+                        geocode_config=geocode_config,
                     )
                 except Exception as e:
                     result = {"error": f"{type(e).__name__}: {e}"}
@@ -514,6 +604,7 @@ def build_ui(
     earth_default: bool,
     max_tool_turns: int,
     max_new_tokens: int,
+    geocode_config: GeocodeConfig | None = None,
 ) -> gr.Blocks:
     tools = _tool_list(pipeline)
 
@@ -557,12 +648,23 @@ def build_ui(
             f"  suffix = {suffix_marker!r}"
         )
 
+    if geocode_config is not None:
+        _region = geocode_config.countrycodes or geocode_config.viewbox
+        geocode_note = (
+            " · **live OSM geocoding** on (store = override/cache"
+            + (f", region `{_region}`" if _region else "")
+            + ")"
+        )
+    else:
+        geocode_note = ""
+
     with gr.Blocks(title="Geo Cyclic Reasoning — Test Bench") as demo:
         gr.Markdown(
             "# Geographic Cyclic-Reasoning Test Bench\n"
             f"Pipeline **{pipeline}** · coordinate order follows the **Earth** "
             "toggle (**[lat, lon]** when on, **[lon, lat]** / x–y when off) "
             "· geometries persisted to `geometries.json`"
+            + geocode_note
         )
 
         # ------------------------- Geometries tab ------------------------- #
@@ -738,6 +840,7 @@ def build_ui(
                     store,
                     earth=bool(earth),
                     input_coord_order=coord_order_for(bool(earth)),
+                    geocode_config=geocode_config,
                     max_tool_turns=max_tool_turns,
                     max_new_tokens=max_new_tokens,
                 ):
@@ -878,6 +981,46 @@ def main():
         action="store_true",
         help="Disable 4-bit quantisation (uses bf16 — needs much more VRAM).",
     )
+    p.add_argument(
+        "--geocode",
+        action="store_true",
+        help="Enable live OpenStreetMap (Nominatim) geocoding for the geocode "
+        "tool instead of looking up the local store only. Ambiguous names are "
+        "disambiguated by geographic proximity to the other places in the same "
+        "call; the local store still acts as an override + cache.",
+    )
+    p.add_argument(
+        "--geocode_countrycodes",
+        default=None,
+        help="Comma-separated ISO country codes to bias/restrict live geocoding, "
+        "e.g. 'us,ca'. (Nominatim countrycodes=.)",
+    )
+    p.add_argument(
+        "--geocode_viewbox",
+        default=None,
+        help="Bounding box 'min_lon,min_lat,max_lon,max_lat' to restrict live "
+        "geocoding to a region (implies bounded). (Nominatim viewbox=.)",
+    )
+    p.add_argument(
+        "--geocode_candidates",
+        type=int,
+        default=5,
+        help="Top-K Nominatim candidates per name considered during "
+        "disambiguation. Default 5.",
+    )
+    p.add_argument(
+        "--geocode_user_agent",
+        default=None,
+        help="Override the Nominatim User-Agent header (its usage policy "
+        f"requires a real one). Default {DEFAULT_GEOCODE_USER_AGENT!r}.",
+    )
+    p.add_argument(
+        "--no_geocode_cache",
+        dest="geocode_cache",
+        action="store_false",
+        help="Do not write live-geocoded points back into geometries.json.",
+    )
+    p.set_defaults(geocode_cache=True)
     args = p.parse_args()
 
     print(f"[chat] Loading base model: {args.base_model}")
@@ -893,6 +1036,21 @@ def main():
         f"{'on (coords [lat, lon])' if args.earth else 'off (coords [lon, lat])'}"
     )
 
+    geocode_config = None
+    if args.geocode:
+        geocode_config = GeocodeConfig(
+            candidates=args.geocode_candidates,
+            countrycodes=args.geocode_countrycodes,
+            viewbox=args.geocode_viewbox,
+            user_agent=args.geocode_user_agent or DEFAULT_GEOCODE_USER_AGENT,
+            cache_writeback=args.geocode_cache,
+        )
+        region = args.geocode_countrycodes or args.geocode_viewbox or "none"
+        print(
+            f"[chat] Live OSM geocoding ON · candidates={geocode_config.candidates} "
+            f"· region={region} · cache_writeback={geocode_config.cache_writeback}"
+        )
+
     demo = build_ui(
         model,
         tokenizer,
@@ -900,6 +1058,7 @@ def main():
         earth_default=args.earth,
         max_tool_turns=args.max_tool_turns,
         max_new_tokens=args.max_new_tokens,
+        geocode_config=geocode_config,
     )
     demo.queue().launch(server_name="0.0.0.0", server_port=args.port, share=args.share)
 
