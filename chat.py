@@ -5,17 +5,23 @@ Run with:
     uv run python chat.py --adapter checkpoints/rl-2 --pipeline 2
 
 Two tabs:
-  - Geometries: add / view / delete points, lines, polygons. Persisted to
-    geometries.json so they survive restarts.
-  - Chat: ask the model questions. The model's emitted tool calls are
-    actually dispatched against the local geometry store, and shown live in
-    a side panel.
+  - Geometries: add / view / delete points, lines, polygons. Coordinate order
+    follows the Earth toggle ([latitude, longitude] when on, [longitude,
+    latitude] / x-y when off); geometries persist to geometries.json across
+    restarts (the raw stored numbers are never rewritten — only re-interpreted).
+  - Chat: ask the model questions. The model's emitted tool calls are actually
+    dispatched against the local geometry store and shown live in a side panel.
+    An "Earth (spherical) backend" checkbox (present and kept in sync on both
+    tabs) toggles cyclic_order between the planar cross-product and the spherical
+    Earth determinant (and the matching system prompt / coordinate order)
+    without restarting.
 
-The tool-call parser is *not* hardcoded for any model: at startup it asks
-the loaded tokenizer to render a sentinel tool_call via apply_chat_template,
-diffs that against a content-only render, and reads off the prefix/suffix
-delimiters the chat template uses. That makes the parsing portable across
-model families that have tool-call-aware chat templates.
+This mirrors evaluate.py's live tool loop: tool calls are parsed with the
+shared tool_call_parsing.extract_tool_calls_from_completion, and the system
+prompt / tool schemas come from prepare_data so the bench always matches what
+the models were trained on (including multi-arc reasoning that issues one
+cyclic_order call per consecutive waypoint pair). The tokenizer's chat template
+is probed once at startup only to derive the per-turn generation stop string.
 """
 
 from __future__ import annotations
@@ -37,11 +43,17 @@ from transformers import (
     TextIteratorStreamer,
 )
 
+from prepare_data import _system_prompt, _tool_list
+from tool_call_parsing import (
+    decode_tool_arguments,
+    discover_tool_markers,
+    extract_tool_calls_from_completion,
+    parse_lonlat_pair,
+)
 from tools import (
-    CYCLIC_ORDER_SCHEMA,
-    GEOCODE_SCHEMA,
     compute_cyclic_order,
-    representative_point,
+    compute_cyclic_order_earth,
+    representative_point_lonlat,
 )
 
 # --------------------------------------------------------------------------- #
@@ -55,32 +67,10 @@ os.makedirs(os.environ['GRADIO_TEMP_DIR'], exist_ok=True)
 
 VALID_TYPES = ("point", "line", "polygon")
 
-
-def _system_prompt(pipeline: int) -> str:
-    """Mirrors prepare_data._system_prompt — kept inline so importing this
-    module doesn't pull pandas/numpy in via prepare_data."""
-    base = (
-        "You are a geographic reasoning assistant. When asked about spatial "
-        "relationships between places, first use the geocode tool to look up "
-        "their coordinates."
-    )
-    if pipeline == 1:
-        return base + (
-            " Then reason about the coordinates to determine the answer. "
-            "Think step by step: compute the vectors from the center to each "
-            "point, then determine the sign of the cross product to decide "
-            "clockwise vs counterclockwise."
-        )
-    return base + (
-        " Then use the cyclic_order tool to determine whether the "
-        "arrangement is clockwise or counterclockwise."
-    )
-
-
-def _tool_list(pipeline: int) -> list[dict]:
-    if pipeline == 1:
-        return [GEOCODE_SCHEMA]
-    return [GEOCODE_SCHEMA, CYCLIC_ORDER_SCHEMA]
+# The system prompt (`_system_prompt`) and tool schemas (`_tool_list`) are
+# imported from prepare_data so this test bench always matches what the models
+# were trained on — including the multi-arc / "neither" instructions and the
+# earth=... variant.
 
 
 # --------------------------------------------------------------------------- #
@@ -201,14 +191,18 @@ def delete_geometry(store: dict[str, dict], name: str) -> None:
     save_store(store)
 
 
-def format_store(store: dict[str, dict]) -> str:
+def format_store(store: dict[str, dict], input_coord_order: str = "latlon") -> str:
     if not store:
         return "_(no geometries yet — add some on the left)_"
-    rows = ["| Name | Type | # pts | Centroid (x, y) |", "|---|---|---|---|"]
+    # Show the model-facing representative point (longitude, latitude),
+    # regardless of the order coordinates were entered/stored in.
+    rows = ["| Name | Type | # pts | Centroid (lon, lat) |", "|---|---|---|---|"]
     for name, geom in store.items():
         try:
-            cx, cy = representative_point(geom)
-            centroid = f"({cx:.4g}, {cy:.4g})"
+            lon, lat = representative_point_lonlat(
+                geom, input_coord_order=input_coord_order
+            )
+            centroid = f"({lon:.4g}, {lat:.4g})"
         except Exception as e:
             centroid = f"_error: {e}_"
         rows.append(
@@ -223,238 +217,58 @@ def format_store(store: dict[str, dict]) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def tool_geocode(place_names: list[str], store: dict[str, dict]) -> dict:
+def tool_geocode(
+    place_names: list[str],
+    store: dict[str, dict],
+    *,
+    input_coord_order: str,
+) -> dict:
     out: dict[str, dict] = {}
     for name in place_names:
-        if name in store:
-            x, y = representative_point(store[name])
-            out[name] = {"longitude": round(x, 6), "latitude": round(y, 6)}
-            continue
-        # Case-insensitive fallback
-        match = next((k for k in store if k.lower() == name.lower()), None)
-        if match is not None:
-            x, y = representative_point(store[match])
-            out[name] = {"longitude": round(x, 6), "latitude": round(y, 6)}
-        else:
+        match = name if name in store else next(
+            (k for k in store if k.lower() == name.lower()), None
+        )
+        if match is None:
             out[name] = {"error": f"unknown place {name!r}"}
+            continue
+        lon, lat = representative_point_lonlat(
+            store[match], input_coord_order=input_coord_order
+        )
+        out[name] = {"longitude": round(lon, 6), "latitude": round(lat, 6)}
     return out
 
 
-def tool_cyclic_order(
-    center: list[float], point_b: list[float], point_c: list[float]
+def tool_cyclic_order(arguments: dict, *, earth: bool) -> dict:
+    center = parse_lonlat_pair(arguments["center"], "center")
+    point_b = parse_lonlat_pair(arguments["point_b"], "point_b")
+    point_c = parse_lonlat_pair(arguments["point_c"], "point_c")
+    cyclic_order_fn = compute_cyclic_order_earth if earth else compute_cyclic_order
+    return {"result": cyclic_order_fn(center, point_b, point_c)}
+
+
+def dispatch_tool(
+    name: str,
+    arguments: dict,
+    store: dict[str, dict],
+    *,
+    earth: bool,
+    input_coord_order: str,
 ) -> dict:
-    return {
-        "result": compute_cyclic_order(
-            (float(center[0]), float(center[1])),
-            (float(point_b[0]), float(point_b[1])),
-            (float(point_c[0]), float(point_c[1])),
-        )
-    }
-
-
-def dispatch_tool(name: str, arguments: dict, store: dict[str, dict]) -> dict:
     if name == "geocode":
-        return tool_geocode(arguments.get("place_names", []), store)
-    if name == "cyclic_order":
-        return tool_cyclic_order(
-            arguments["center"], arguments["point_b"], arguments["point_c"]
+        return tool_geocode(
+            arguments.get("place_names", []),
+            store,
+            input_coord_order=input_coord_order,
         )
+    if name == "cyclic_order":
+        return tool_cyclic_order(arguments, earth=earth)
     raise ValueError(f"Unknown tool {name!r}")
 
 
-# --------------------------------------------------------------------------- #
-# Tool-call marker auto-discovery (chat-template-derived, not regex-hardcoded)
-# --------------------------------------------------------------------------- #
-
-
-def _match_braces(text: str, start: int) -> int:
-    """Given an opening '{' at text[start], return index just past the
-    matching '}'. Returns -1 on imbalance. Honours strings + escapes."""
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if esc:
-            esc = False
-            continue
-        if c == "\\" and in_str:
-            esc = True
-            continue
-        if c == '"':
-            in_str = not in_str
-            continue
-        if in_str:
-            continue
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return i + 1
-    return -1
-
-
-def discover_tool_markers(tokenizer, tools: list[dict]) -> tuple[str, str] | None:
-    """Render a sentinel tool_call message via apply_chat_template, diff it
-    against a content-only render to extract the prefix/suffix the chat
-    template wraps tool-call JSON with. Returns (prefix, suffix), or None
-    if the template can't be probed."""
-    SENTINEL_TOOL = "ZZPROBETOOL"
-    SENTINEL_TXT = "ZZPROBETXT"
-
-    probe_tool = [
-        {"role": "user", "content": "u"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "probe0",
-                    "type": "function",
-                    "function": {
-                        "name": SENTINEL_TOOL,
-                        "arguments": json.dumps({"k": 1}),
-                    },
-                }
-            ],
-        },
-    ]
-    probe_text = [
-        {"role": "user", "content": "u"},
-        {"role": "assistant", "content": SENTINEL_TXT},
-    ]
-
-    def _render(msgs):
-        try:
-            return tokenizer.apply_chat_template(
-                msgs, tools=tools, tokenize=False, add_generation_prompt=False
-            )
-        except (TypeError, Exception):
-            try:
-                return tokenizer.apply_chat_template(
-                    msgs, tokenize=False, add_generation_prompt=False
-                )
-            except Exception:
-                return None
-
-    rendered_tool = _render(probe_tool)
-    rendered_text = _render(probe_text)
-    if rendered_tool is None or rendered_text is None:
-        return None
-    if SENTINEL_TOOL not in rendered_tool or SENTINEL_TXT not in rendered_text:
-        return None
-
-    # Common prefix
-    pre_len = 0
-    n = min(len(rendered_tool), len(rendered_text))
-    while pre_len < n and rendered_tool[pre_len] == rendered_text[pre_len]:
-        pre_len += 1
-
-    # Common suffix
-    suf_len = 0
-    while (
-        suf_len < len(rendered_tool) - pre_len
-        and suf_len < len(rendered_text) - pre_len
-        and rendered_tool[-1 - suf_len] == rendered_text[-1 - suf_len]
-    ):
-        suf_len += 1
-
-    diverged = rendered_tool[pre_len : len(rendered_tool) - suf_len]
-    sent_pos = diverged.find(SENTINEL_TOOL)
-    if sent_pos == -1:
-        return None
-    json_start = diverged.rfind("{", 0, sent_pos)
-    if json_start == -1:
-        return None
-    json_end = _match_braces(diverged, json_start)
-    if json_end == -1:
-        return None
-
-    prefix = diverged[:json_start]
-    suffix = diverged[json_end:]
-    if not prefix and not suffix:
-        return None
-    return prefix, suffix
-
-
-# --------------------------------------------------------------------------- #
-# Tool-call extraction from generated text
-# --------------------------------------------------------------------------- #
-
-
-def extract_tool_calls(
-    text: str, prefix: str, suffix: str
-) -> tuple[list[dict], str]:
-    """Walk through `text` looking for `prefix` … JSON … `suffix` blocks.
-    Returns (tool_calls, narration_text). `tool_calls` is a list of
-    {"name": str, "arguments": dict}. `narration_text` is the assistant's
-    plain-language content with the tool-call blocks removed."""
-    p_strip = prefix.strip() or prefix
-    s_strip = suffix.strip() or suffix
-
-    tool_calls: list[dict] = []
-    keep: list[str] = []
-    pos = 0
-
-    while pos < len(text):
-        p_idx = text.find(p_strip, pos)
-        if p_idx == -1:
-            keep.append(text[pos:])
-            break
-        keep.append(text[pos:p_idx])
-
-        # Skip past prefix (and any whitespace) to find opening brace
-        scan = p_idx + len(p_strip)
-        while scan < len(text) and text[scan] in " \t\n\r":
-            scan += 1
-        if scan >= len(text) or text[scan] != "{":
-            # Looked like a prefix but no JSON follows — keep raw and move on.
-            keep.append(text[p_idx : scan + 1])
-            pos = scan + 1
-            continue
-
-        json_start = scan
-        json_end = _match_braces(text, json_start)
-        if json_end == -1:
-            # Unclosed JSON — keep the rest verbatim and stop.
-            keep.append(text[p_idx:])
-            break
-
-        json_str = text[json_start:json_end]
-        try:
-            obj = json.loads(json_str)
-        except json.JSONDecodeError:
-            keep.append(text[p_idx:json_end])
-            pos = json_end
-            continue
-
-        # Advance past the suffix marker if present.
-        s_idx = text.find(s_strip, json_end) if s_strip else -1
-        advance_to = (
-            s_idx + len(s_strip)
-            if s_idx != -1 and s_idx - json_end < 32
-            else json_end
-        )
-
-        # Validate the JSON looks like a tool call.
-        if isinstance(obj, dict) and isinstance(obj.get("name"), str):
-            args = obj.get("arguments", obj.get("parameters", {}))
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {}
-            if not isinstance(args, dict):
-                args = {}
-            tool_calls.append({"name": obj["name"], "arguments": args})
-        else:
-            keep.append(text[p_idx:advance_to])
-
-        pos = advance_to
-
-    narration = "".join(keep).strip()
-    return tool_calls, narration
+# Tool-call marker discovery (`discover_tool_markers`) and tool-call extraction
+# (`extract_tool_calls_from_completion`) are imported from tool_call_parsing so
+# this test bench parses model output exactly like evaluate.py does. Markers are
+# discovered once at startup purely to derive the generation stop string.
 
 
 # --------------------------------------------------------------------------- #
@@ -521,7 +335,7 @@ def stream_one_turn(
     model,
     tokenizer,
     suffix_marker: str | None,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 1024,
 ) -> Generator[str, None, str]:
     """Yield incrementally accumulated assistant text. Returns the final
     full text once generation completes (via StopIteration value)."""
@@ -554,21 +368,32 @@ def stream_one_turn(
     return accumulated
 
 
+def _call_name(call: dict) -> str:
+    function = call.get("function") if isinstance(call, dict) else None
+    if isinstance(function, dict) and isinstance(function.get("name"), str):
+        return function["name"]
+    return "unknown"
+
+
 def run_conversation(
     user_message: str,
     history_messages: list[dict],
     tools: list[dict],
     model,
     tokenizer,
-    prefix_marker: str,
-    suffix_marker: str,
+    suffix_marker: str | None,
     store: dict[str, dict],
-    max_iters: int = 6,
+    *,
+    earth: bool,
+    input_coord_order: str,
+    max_tool_turns: int = 12,
+    max_new_tokens: int = 1024,
 ) -> Generator[tuple[list[dict], list[dict], list[dict]], None, None]:
     """Drive one user query through the tool-call loop.
 
     Yields (messages, chat_display, tool_log_display) tuples after every
-    streamed chunk and every tool dispatch.
+    streamed chunk and every tool dispatch. Tool calls are parsed with the
+    shared `extract_tool_calls_from_completion` so this matches evaluate.py.
     """
     messages = history_messages + [{"role": "user", "content": user_message}]
     chat_display: list[dict] = [
@@ -578,8 +403,10 @@ def run_conversation(
     tool_log: list[dict] = []
     yield messages, chat_display, tool_log
 
-    for _ in range(max_iters):
-        gen = stream_one_turn(messages, tools, model, tokenizer, suffix_marker)
+    for _ in range(max_tool_turns):
+        gen = stream_one_turn(
+            messages, tools, model, tokenizer, suffix_marker, max_new_tokens
+        )
         full_text = ""
         try:
             while True:
@@ -589,57 +416,65 @@ def run_conversation(
         except StopIteration as stop:
             full_text = stop.value or full_text
 
-        tool_calls, narration = extract_tool_calls(
-            full_text, prefix_marker, suffix_marker
-        )
+        parsed = extract_tool_calls_from_completion(full_text)
 
-        if not tool_calls:
-            # Final assistant turn.
+        if not parsed.tool_calls:
+            # Final assistant turn (no further tool calls).
             messages = messages + [{"role": "assistant", "content": full_text}]
             chat_display[-1]["content"] = full_text
             yield messages, chat_display, tool_log
             return
 
-        # Persist the assistant turn that issued the tool calls.
-        assistant_msg: dict = {
-            "role": "assistant",
-            "content": narration or "",
-            "tool_calls": [
-                {
-                    "id": f"call_{len(messages)}_{i}",
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["arguments"]),
-                    },
-                }
-                for i, tc in enumerate(tool_calls)
-            ],
-        }
+        # Persist the assistant turn that issued the tool calls. parsed.tool_calls
+        # are already in OpenAI function-call format, so the chat template can
+        # re-render them on the next turn.
+        assistant_msg: dict = {"role": "assistant", "tool_calls": parsed.tool_calls}
+        if parsed.content:
+            assistant_msg["content"] = parsed.content
         messages = messages + [assistant_msg]
 
-        for i, tc in enumerate(tool_calls):
+        # Show narration (not raw <tool_call> markup) in the main chat bubble.
+        chat_display[-1]["content"] = parsed.content or full_text
+
+        for call in parsed.tool_calls:
+            name = _call_name(call)
+            try:
+                arguments = decode_tool_arguments(call["function"]["arguments"])
+            except Exception as e:
+                arguments = {}
+                arg_error = f"{type(e).__name__}: {e}"
+            else:
+                arg_error = None
+
             tool_log.append(
                 {
                     "role": "user",
                     "content": (
-                        f"**call** `{tc['name']}`\n"
-                        f"```json\n{json.dumps(tc['arguments'], indent=2)}\n```"
+                        f"**call** `{name}`\n"
+                        f"```json\n{json.dumps(arguments, indent=2)}\n```"
                     ),
                 }
             )
             yield messages, chat_display, tool_log
 
-            try:
-                result = dispatch_tool(tc["name"], tc["arguments"], store)
-            except Exception as e:
-                result = {"error": f"{type(e).__name__}: {e}"}
+            if arg_error is not None:
+                result: dict = {"error": f"could not decode arguments: {arg_error}"}
+            else:
+                try:
+                    result = dispatch_tool(
+                        name,
+                        arguments,
+                        store,
+                        earth=earth,
+                        input_coord_order=input_coord_order,
+                    )
+                except Exception as e:
+                    result = {"error": f"{type(e).__name__}: {e}"}
 
             messages = messages + [
                 {
                     "role": "tool",
-                    "name": tc["name"],
-                    "tool_call_id": assistant_msg["tool_calls"][i]["id"],
+                    "name": name,
                     "content": json.dumps(result),
                 }
             ]
@@ -647,7 +482,7 @@ def run_conversation(
                 {
                     "role": "assistant",
                     "content": (
-                        f"**result** `{tc['name']}`\n"
+                        f"**result** `{name}`\n"
                         f"```json\n{json.dumps(result, indent=2)}\n```"
                     ),
                 }
@@ -658,10 +493,10 @@ def run_conversation(
         chat_display.append({"role": "assistant", "content": ""})
         yield messages, chat_display, tool_log
 
-    # Hit max_iters without a final answer.
+    # Hit max_tool_turns without a final answer.
     chat_display[-1]["content"] = (
         chat_display[-1]["content"]
-        + "\n\n_(stopped: tool-call loop hit max iterations)_"
+        + "\n\n_(stopped: tool-call loop hit max tool turns)_"
     )
     yield messages, chat_display, tool_log
 
@@ -671,33 +506,78 @@ def run_conversation(
 # --------------------------------------------------------------------------- #
 
 
-def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
+def build_ui(
+    model,
+    tokenizer,
+    pipeline: int,
+    *,
+    earth_default: bool,
+    max_tool_turns: int,
+    max_new_tokens: int,
+) -> gr.Blocks:
     tools = _tool_list(pipeline)
-    sys_prompt = _system_prompt(pipeline)
 
+    def sys_prompt_for(earth: bool) -> str:
+        return _system_prompt(pipeline, earth=earth)
+
+    # Coordinate order is driven by the Earth toggle: Earth on reads geometries
+    # as [latitude, longitude] (geographic); Earth off reads them as
+    # [longitude, latitude] (x-y / planar).
+    def coord_order_for(earth: bool) -> str:
+        return "latlon" if earth else "lonlat"
+
+    def coords_label(order: str) -> str:
+        return f"Coordinates ([{order}] order)"
+
+    def coords_placeholder(order: str) -> str:
+        paris = "48.85, 2.35" if order == "latlon" else "2.35, 48.85"
+        return (
+            "JSON, one pair per line, or semicolon-separated.\n"
+            f"Enter each pair as [{order}], e.g. Paris:\n"
+            f"[[{paris}]]\n"
+            "or a polygon, one vertex per line:\n"
+            "0, 0\n2, 0\n2, 2\n0, 2"
+        )
+
+    # Markers are discovered once, purely to derive the generation stop string
+    # (so each turn halts at the end of a tool call). Parsing of the generated
+    # text is done by the shared extract_tool_calls_from_completion.
     markers = discover_tool_markers(tokenizer, tools)
     if markers is None:
         print(
             "[chat] WARNING: chat template did not yield discoverable tool-call "
-            "markers; falling back to <tool_call>/</tool_call>."
+            "markers; falling back to </tool_call> stop string."
         )
-        prefix_marker, suffix_marker = "<tool_call>", "</tool_call>"
+        suffix_marker = "</tool_call>"
     else:
-        prefix_marker, suffix_marker = markers
+        _prefix_marker, suffix_marker = markers
         print(
             "[chat] Auto-discovered tool-call markers from chat template:\n"
-            f"  prefix = {prefix_marker!r}\n"
+            f"  prefix = {_prefix_marker!r}\n"
             f"  suffix = {suffix_marker!r}"
         )
 
     with gr.Blocks(title="Geo Cyclic Reasoning — Test Bench") as demo:
         gr.Markdown(
             "# Geographic Cyclic-Reasoning Test Bench\n"
-            f"Pipeline **{pipeline}** · geometries persisted to `geometries.json`"
+            f"Pipeline **{pipeline}** · coordinate order follows the **Earth** "
+            "toggle (**[lat, lon]** when on, **[lon, lat]** / x–y when off) "
+            "· geometries persisted to `geometries.json`"
         )
 
         # ------------------------- Geometries tab ------------------------- #
+        _initial_order = coord_order_for(earth_default)
         with gr.Tab("Geometries"):
+            with gr.Row():
+                earth_geom = gr.Checkbox(
+                    label="Earth (spherical) backend",
+                    value=earth_default,
+                    info=(
+                        "Controls how coordinates below are read: on → "
+                        "[latitude, longitude]; off → [longitude, latitude] "
+                        "(x-y). Stays in sync with the Chat tab."
+                    ),
+                )
             with gr.Row():
                 with gr.Column(scale=1):
                     name_in = gr.Textbox(label="Name", placeholder="e.g. Paris")
@@ -708,19 +588,16 @@ def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
                         info="'auto' picks point/line/polygon by point count.",
                     )
                     coords_in = gr.Textbox(
-                        label="Coordinates",
+                        label=coords_label(_initial_order),
                         lines=6,
-                        placeholder=(
-                            "JSON, one pair per line, or semicolon-separated:\n"
-                            "[[2.35, 48.85]]\n"
-                            "or\n"
-                            "0, 0\n2, 0\n2, 2\n0, 2"
-                        ),
+                        placeholder=coords_placeholder(_initial_order),
                     )
                     add_btn = gr.Button("Add geometry", variant="primary")
                     add_status = gr.Markdown()
                 with gr.Column(scale=2):
-                    geom_table = gr.Markdown(value=format_store(load_store()))
+                    geom_table = gr.Markdown(
+                        value=format_store(load_store(), _initial_order)
+                    )
                     delete_dd = gr.Dropdown(
                         label="Delete",
                         choices=list(load_store().keys()),
@@ -730,7 +607,7 @@ def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
                         delete_btn = gr.Button("Delete selected")
                         refresh_btn = gr.Button("Refresh")
 
-            def _on_add(name, gtype, coords_text):
+            def _on_add(name, gtype, coords_text, earth):
                 store = load_store()
                 try:
                     coords = parse_coords(coords_text or "")
@@ -741,11 +618,11 @@ def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
                 store = load_store()
                 return (
                     msg,
-                    format_store(store),
+                    format_store(store, coord_order_for(bool(earth))),
                     gr.update(choices=list(store.keys()), value=None),
                 )
 
-            def _on_delete(name):
+            def _on_delete(name, earth):
                 store = load_store()
                 if not name:
                     msg = "_(select a geometry first)_"
@@ -758,40 +635,55 @@ def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
                 store = load_store()
                 return (
                     msg,
-                    format_store(store),
+                    format_store(store, coord_order_for(bool(earth))),
                     gr.update(choices=list(store.keys()), value=None),
                 )
 
-            def _on_refresh():
+            def _on_refresh(earth):
                 store = load_store()
                 return (
-                    format_store(store),
+                    format_store(store, coord_order_for(bool(earth))),
                     gr.update(choices=list(store.keys())),
                 )
 
             add_btn.click(
                 _on_add,
-                inputs=[name_in, type_in, coords_in],
+                inputs=[name_in, type_in, coords_in, earth_geom],
                 outputs=[add_status, geom_table, delete_dd],
             )
             delete_btn.click(
                 _on_delete,
-                inputs=[delete_dd],
+                inputs=[delete_dd, earth_geom],
                 outputs=[add_status, geom_table, delete_dd],
             )
             refresh_btn.click(
-                _on_refresh, inputs=[], outputs=[geom_table, delete_dd]
+                _on_refresh, inputs=[earth_geom], outputs=[geom_table, delete_dd]
             )
 
         # --------------------------- Chat tab ----------------------------- #
         with gr.Tab("Chat"):
             messages_state = gr.State(
-                [{"role": "system", "content": sys_prompt}]
+                [{"role": "system", "content": sys_prompt_for(earth_default)}]
             )
             tool_log_state = gr.State([])
 
             with gr.Row():
+                earth_chat = gr.Checkbox(
+                    label="Earth (spherical) backend",
+                    value=earth_default,
+                    info=(
+                        "On: cyclic_order uses the spherical Earth determinant "
+                        "(and, in pipeline 1, the Earth system prompt) and "
+                        "coordinates are read as [lat, lon]. Off: the planar "
+                        "cross-product backend with [lon, lat] (x-y). Stays in "
+                        "sync with the Geometries tab."
+                    ),
+                )
+
+            with gr.Row():
                 with gr.Column(scale=3):
+                    # Gradio 6 Chatbot is messages-only ({"role","content"} dicts);
+                    # the legacy `type`/"tuples" format was removed.
                     chatbot = gr.Chatbot(
                         label="Assistant",
                         height=500,
@@ -822,11 +714,15 @@ def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
                     if m["role"] in ("user", "assistant") and m.get("content")
                 ]
 
-            def _on_send(user_text, messages, prior_tool_log):
+            def _on_send(user_text, messages, prior_tool_log, earth):
                 if not user_text or not user_text.strip():
                     yield messages, gr.update(), prior_tool_log, ""
                     return
                 store = load_store()
+                # Keep the system prompt in sync with the current Earth toggle.
+                messages = [
+                    {"role": "system", "content": sys_prompt_for(bool(earth))}
+                ] + list(messages[1:])
                 prior_display = _messages_to_display(messages)
 
                 final_messages = messages
@@ -838,9 +734,12 @@ def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
                     tools,
                     model,
                     tokenizer,
-                    prefix_marker,
                     suffix_marker,
                     store,
+                    earth=bool(earth),
+                    input_coord_order=coord_order_for(bool(earth)),
+                    max_tool_turns=max_tool_turns,
+                    max_new_tokens=max_new_tokens,
                 ):
                     final_messages = new_messages
                     yield (
@@ -857,9 +756,9 @@ def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
                     "",
                 )
 
-            def _on_clear():
+            def _on_clear(earth):
                 return (
-                    [{"role": "system", "content": sys_prompt}],
+                    [{"role": "system", "content": sys_prompt_for(bool(earth))}],
                     [],
                     [],
                     [],
@@ -868,7 +767,7 @@ def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
 
             send_btn.click(
                 _on_send,
-                inputs=[user_in, messages_state, tool_log_state],
+                inputs=[user_in, messages_state, tool_log_state, earth_chat],
                 outputs=[messages_state, chatbot, tool_log, user_in],
             ).then(
                 lambda log: log,
@@ -877,7 +776,7 @@ def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
             )
             user_in.submit(
                 _on_send,
-                inputs=[user_in, messages_state, tool_log_state],
+                inputs=[user_in, messages_state, tool_log_state, earth_chat],
                 outputs=[messages_state, chatbot, tool_log, user_in],
             ).then(
                 lambda log: log,
@@ -886,9 +785,35 @@ def build_ui(model, tokenizer, pipeline: int) -> gr.Blocks:
             )
             clear_btn.click(
                 _on_clear,
-                inputs=[],
+                inputs=[earth_chat],
                 outputs=[messages_state, tool_log_state, chatbot, tool_log, user_in],
             )
+
+        # ---- Keep the two Earth checkboxes (and the coordinate order they
+        # imply) in sync. Wired with .input() so it fires only on real user
+        # clicks, not on the programmatic mirror update — avoiding a feedback
+        # loop. Both update the shared geometry table + coordinate input field.
+        def _on_earth_toggle(earth):
+            order = coord_order_for(bool(earth))
+            return (
+                bool(earth),
+                format_store(load_store(), order),
+                gr.update(
+                    label=coords_label(order),
+                    placeholder=coords_placeholder(order),
+                ),
+            )
+
+        earth_chat.input(
+            _on_earth_toggle,
+            inputs=[earth_chat],
+            outputs=[earth_geom, geom_table, coords_in],
+        )
+        earth_geom.input(
+            _on_earth_toggle,
+            inputs=[earth_geom],
+            outputs=[earth_chat, geom_table, coords_in],
+        )
 
     return demo
 
@@ -919,6 +844,33 @@ def main():
         help="1: model reasons internally after geocode. 2: model also calls "
         "cyclic_order. Default 2 (more visible tool calls).",
     )
+    p.add_argument(
+        "--earth",
+        action="store_true",
+        help="Start with the Earth (spherical) backend toggle enabled. It can be "
+        "toggled live from either tab. Earth on reads coordinates as [lat, lon]; "
+        "off reads them as [lon, lat] (x-y).",
+    )
+    p.add_argument(
+        "--no_earth",
+        dest="earth",
+        action="store_false",
+        help="Start with the Earth backend toggle disabled (planar).",
+    )
+    p.set_defaults(earth=True)
+    p.add_argument(
+        "--max_tool_turns",
+        type=int,
+        default=12,
+        help="Maximum assistant/tool iterations per query (handles n-2 cyclic "
+        "calls for large n). Default 12.",
+    )
+    p.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=1024,
+        help="Generation budget per assistant turn. Default 1024.",
+    )
     p.add_argument("--port", type=int, default=7860)
     p.add_argument("--share", action="store_true", help="Expose a Gradio share URL.")
     p.add_argument(
@@ -936,8 +888,19 @@ def main():
     )
     print(f"[chat] Model loaded on device: {model.device}")
     print(f"[chat] Geometries file: {GEOMETRIES_PATH}")
+    print(
+        f"[chat] Pipeline {args.pipeline} · earth default "
+        f"{'on (coords [lat, lon])' if args.earth else 'off (coords [lon, lat])'}"
+    )
 
-    demo = build_ui(model, tokenizer, args.pipeline)
+    demo = build_ui(
+        model,
+        tokenizer,
+        args.pipeline,
+        earth_default=args.earth,
+        max_tool_turns=args.max_tool_turns,
+        max_new_tokens=args.max_new_tokens,
+    )
     demo.queue().launch(server_name="0.0.0.0", server_port=args.port, share=args.share)
 
 
