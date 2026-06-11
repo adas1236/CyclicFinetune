@@ -9,6 +9,7 @@ scripts
 geometries.json
 .gradio/
 *.md
+!README.md
 gradio_tmp
 scratch.py
 secrets.env
